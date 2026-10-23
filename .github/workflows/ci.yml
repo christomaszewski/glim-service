@@ -1,0 +1,136 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  ROS_DISTRO: lyrical
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Build the runtime image — the gate that proves the pinned upstream stack
+  # (glim.repos) still fetches, compiles, links, and loads (the runtime gate in
+  # docker/Dockerfile.runtime). No push: `rig build` (tools/build_image.sh)
+  # publishes; CI only validates. Then run the test suite INSIDE the image: the
+  # supervisor against the real upstream config defaults, as root, on the image's
+  # Python.
+  # ---------------------------------------------------------------------------
+  build-image:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {runner: ubuntu-latest, arch: amd64}
+          - {runner: ubuntu-24.04-arm, arch: arm64}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+        id: buildx
+      # Layer caches omit RUN cache mounts. Restore ccache separately so the next
+      # source pin reuses objects from the same compiler environment (GTSAM is
+      # most of the compile). Register the cache before cache-dance: post steps
+      # run in reverse order, so extraction finishes before actions/cache saves.
+      - name: Restore compiler cache
+        id: compiler-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/glim-ccache
+          key: glim-ccache-v1-${{ runner.os }}-${{ matrix.arch }}-${{ env.ROS_DISTRO }}-${{ hashFiles('docker/Dockerfile.runtime', 'glim.repos') }}-${{ github.sha }}
+          restore-keys: |
+            glim-ccache-v1-${{ runner.os }}-${{ matrix.arch }}-${{ env.ROS_DISTRO }}-${{ hashFiles('docker/Dockerfile.runtime', 'glim.repos') }}-
+            glim-ccache-v1-${{ runner.os }}-${{ matrix.arch }}-${{ env.ROS_DISTRO }}-
+      - name: Restore BuildKit compiler cache mount
+        uses: reproducible-containers/buildkit-cache-dance@5422eac04292c961a382e0f584ea0f03ad9da723 # v3.4.0
+        with:
+          builder: ${{ steps.buildx.outputs.name }}
+          scratch-dir: ${{ runner.temp }}/glim-ccache-dance
+          cache-map: |
+            {
+              "${{ runner.temp }}/glim-ccache": {
+                "target": "/root/.cache/ccache",
+                "id": "glim-ccache-${{ env.ROS_DISTRO }}-${{ matrix.arch }}",
+                "sharing": "locked"
+              }
+            }
+          skip-extraction: ${{ steps.compiler-cache.outputs.cache-hit }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.runtime
+          platforms: linux/${{ matrix.arch }}
+          push: false
+          load: true
+          tags: glim:ci
+          cache-from: type=gha,scope=runtime-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=runtime-${{ matrix.arch }}
+          build-args: |
+            ROS_DISTRO=${{ env.ROS_DISTRO }}
+            BUILD_JOBS=4
+      - name: Test suite inside the image
+        run: |
+          docker run --rm --network none -e PYTHONDONTWRITEBYTECODE=1 \
+            -v "$PWD:/workspace:ro" -w /workspace glim:ci \
+            python3 -m unittest discover -s tests -v
+
+  # ---------------------------------------------------------------------------
+  # rig launcher contract, executable (see rigging.yaml). `rig certify` runs
+  # `glim-up <config> config` (and status/state) under a poisoned fleet env and
+  # asserts the contract held: COMPOSE_PROJECT_NAME honored (no -p), image pulled
+  # from RIG_IMAGE_REGISTRY as :RIG_IMAGE_TAG, fleet ROS env passed through,
+  # deterministic + name-derived output, external-volume match, the operational-
+  # state trio. Bare runner — needs docker compose + PyYAML, not ROS.
+  # ---------------------------------------------------------------------------
+  certify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: christomaszewski/rig
+          path: .rig
+      - run: python3 -m pip install --user pyyaml
+      - uses: ./.rig/.github/actions/setup-build-probe
+      - name: rig certify (launcher and build contracts)
+        run: ./.rig/rig certify --repo . --config autonomy/glim.example.yaml --require-build-check
+
+  # ---------------------------------------------------------------------------
+  # Host-side regressions: config rendering, the launcher against a fake docker,
+  # the supervisor state machine/health/socket, and the build entrypoint's
+  # forwarding of the rig build env (a stub `docker` records its argv). Config
+  # composition tests skip here (no upstream defaults); build-image runs them.
+  # ---------------------------------------------------------------------------
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 -m pip install --user pyyaml
+      - name: launcher, renderer and supervisor regressions
+        run: python3 -m unittest discover -s tests -v
+      - name: portable build contract tests
+        run: python3 -m unittest discover -s tools -p 'test_build_contract.py' -v
+
+  # ---------------------------------------------------------------------------
+  # Shell hygiene on the deploy surface (launcher + build scripts + entrypoints).
+  # ---------------------------------------------------------------------------
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck launcher + build scripts + entrypoints
+        run: shellcheck -x glim-up tools/build_image.sh tools/rig-build.sh docker/entrypoints/ros-entrypoint.sh docker/entrypoints/glim-statectl

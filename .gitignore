@@ -1,0 +1,27 @@
+# Upstream sources — fetched on demand with `python3 tools/fetch_upstream.py src` (local dev) and by
+# the Docker build. Never committed: this wrapper stays source-free; glim.repos is the pin.
+/src/
+
+# Build artifacts (local colcon/cmake)
+build/
+install/
+log/
+.cache/
+
+# Launcher staging (rendered per-instance files written by glim-up)
+/var/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+
+# IDE / OS / local tooling
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+.claude/
+.env

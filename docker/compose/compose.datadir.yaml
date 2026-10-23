@@ -1,0 +1,11 @@
+# Overlay selected by `glim-up` when a host data dir is known (RIG_DATA_DIR from rig, or
+# GLIM_DATA_DIR standalone): map sessions go to the data dir instead of the fallback volume. The
+# supervisor pins the open run at each session start — /data/current/maps/<name>/<session>/ when rig
+# has a run open (`current` is a RELATIVE symlink, so it resolves inside this mount), else the flat
+# /data/maps/<name>/<session>/.
+services:
+  glim:
+    environment:
+      GLIM_MAP_ROOT: /data
+    volumes:
+      - ${GLIM_DATA_HOST}:/data

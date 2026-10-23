@@ -1,0 +1,62 @@
+# Deployment-grade compose for ONE GLIM instance — parameterized + launched by `glim-up` (which
+# renders the instance file and exports the env vars below). Run it via the launcher, not directly.
+#
+# Multi-instance safe: NO container_name; identity comes from the compose project (the rig-injected
+# COMPOSE_PROJECT_NAME, or glim_<name> standalone — the launcher handles both) and the ROS
+# namespace. Health comes from the runtime image's baked HEALTHCHECK (the supervisor's verdict).
+services:
+  glim:
+    # Image precedence (Docker Compose interpolation): GLIM_IMAGE (a full per-service override, e.g.
+    # a local glim:dev) wins; else the rig-injected fleet policy — RIG_IMAGE_REGISTRY prefixed onto
+    # glim, pulled as :RIG_IMAGE_TAG (what `rig build` pushed); else the bare local glim:latest.
+    image: ${GLIM_IMAGE:-${RIG_IMAGE_REGISTRY:+${RIG_IMAGE_REGISTRY}/}glim:${RIG_IMAGE_TAG:-latest}}
+    network_mode: host          # subscribe to the sensors' topics + reach the zenoh router on localhost
+    ipc: host                   # shared-memory transport: Fast DDS SHM, and LOAD-BEARING for zenoh SHM
+                                # — point clouds are the vehicle's largest messages; without a shared
+                                # IPC namespace every scan is copied over TCP loopback
+    # Zenoh locks its own pool and mapped peer segments; Docker's default 8 MiB memlock limit
+    # cannot hold a point-cloud-sized pool, even with ipc: host.
+    ulimits:
+      memlock: { soft: -1, hard: -1 }
+    restart: unless-stopped
+    init: true                  # reap GLIM and its threads' children when the supervisor exits
+    # Maximum budget, not a fixed wait: GLIM finishes optimizing and serializes the map on stop.
+    # Rendered from the config's map.save_timeout_s (+ margin) by the launcher.
+    stop_grace_period: ${GLIM_STOP_GRACE:-300s}
+    environment:
+      ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-0}
+      # both RMWs ship in the image; rig exports the fleet's choice. The service NEVER starts a
+      # zenoh router — that is rig-managed infrastructure; sessions connect to tcp/localhost:7447.
+      RMW_IMPLEMENTATION: ${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}
+      # rig-injectable zenoh session tuning: semicolon-separated config overrides, e.g.
+      # ZENOH_CONFIG_OVERRIDE='connect/endpoints=["tcp/192.168.1.1:7447"]'. Empty = zenoh defaults.
+      ZENOH_CONFIG_OVERRIDE: ${ZENOH_CONFIG_OVERRIDE:-}
+      # launcher-rendered pairs from the config's `zenoh:` block, appended by the entrypoint AFTER
+      # the injected value above (config wins on key conflict), ONLY under rmw_zenoh_cpp.
+      GLIM_ZENOH_OVERRIDE: ${GLIM_ZENOH_OVERRIDE:-}
+      GLIM_NAME: ${GLIM_NAME:-glim}
+      GLIM_NAMESPACE: ${GLIM_NAMESPACE:-}
+      # fleet identity for /diagnostics (health.vehicle_id); rig exports it
+      VEHICLE_ID: ${VEHICLE_ID:-}
+      # where map sessions are written; compose.datadir.yaml points it at the vehicle data dir
+      GLIM_MAP_ROOT: /var/lib/glim/store
+    volumes:
+      # the rendered instance file, read-only (a single-file mount; not nested in any :ro dir)
+      - ${GLIM_INSTANCE_HOST}:/etc/glim/instance.json:ro
+      # the startup target (RIG_TARGET_STATE > initial_state > active), resolved by the launcher.
+      # A file at a fixed path, so a changed target never recreates a running container; the
+      # supervisor reads it only when the container has no persisted target of its own.
+      - ${GLIM_TARGET_HOST}:/etc/glim/target:ro
+      # fallback map store: maps/<name>/<session>/ (config, logs, GLIM dump) when no data dir is
+      # known. Always mounted, so the declared external volume is part of every render. `maps` is a
+      # static local alias for the per-instance external volume below (compose does NOT
+      # interpolate a volume's map KEY).
+      - maps:/var/lib/glim/store
+
+# Per-instance fallback map store. external: true -> compose only USES it (glim-up creates it on
+# `up`, rig GCs it on `rig down --purge`); the explicit name keeps it un-prefixed so rig can match it
+# against rigging.yaml `external_volumes`.
+volumes:
+  maps:
+    external: true
+    name: glim_${GLIM_NAME}_maps

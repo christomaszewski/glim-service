@@ -1,0 +1,17 @@
+# Keep the build context small + reproducible: the image build fetches its own pinned sources and
+# needs only the manifest, the fetch helper, the supervisor and docker/ — never a host src/ or
+# build/ (another arch's objects would poison the in-container build).
+.git/
+.github/
+.claude/
+/src/
+/var/
+build/
+install/
+log/
+.cache/
+tests/
+autonomy/
+**/__pycache__/
+*.pyc
+.venv/

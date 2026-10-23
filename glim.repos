@@ -1,0 +1,33 @@
+# Upstream GLIM stack — fetched at image-build time by docker/Dockerfile.runtime
+# (tools/fetch_upstream.py, using vcstool). Nothing upstream is committed to this repo; it lives
+# only in the build and in a gitignored src/ for local dev.
+#
+# Every `version` MUST be a full commit SHA (never a branch or tag) for reproducible builds;
+# fetch_upstream.py refuses anything else and records the resolved commits in the image at
+# /opt/glim/share/upstream-sources.json. Bump these together: each layer pins the API of the one
+# below it (see README "Updating upstream").
+#
+#   gtsam        4.3a1 — the release glim + gtsam_points are tested against. NOT 4.3.0: this glim
+#                still calls gtsam::make_shared, which 4.3.0 removed.
+#   gtsam_points master after v1.2.2 — glim master needs GaussianVoxelMap::has_index (#103).
+#   glim         master after v1.2.2 — fmt >= 11 build fix (#327; Ubuntu 26.04 ships fmt 10/11),
+#                robust initial state estimation (#320), separate IMU bias noise (#323).
+#   glim_ros2    master after v1.2.2 — angular velocity scale (#75, pairs with glim #318),
+#                covariance outputs (#71), exit crash fix (#74), rviz submap fix (#76).
+repositories:
+  gtsam:
+    type: git
+    url: https://github.com/borglab/gtsam.git
+    version: 2f3e56c0ddbd3a1aa54ed043643b553d26a069f6  # 4.3a1
+  gtsam_points:
+    type: git
+    url: https://github.com/koide3/gtsam_points.git
+    version: 8e94654558dfbe7ddb0341de300daaf17e25ee02  # v1.2.2-4 (2026-10-06)
+  glim:
+    type: git
+    url: https://github.com/koide3/glim.git
+    version: 1a197c999e4865f5cab7c9cd25474128413ebbca  # v1.2.2-10 (2026-10-08)
+  glim_ros2:
+    type: git
+    url: https://github.com/koide3/glim_ros2.git
+    version: 4d4ec524ccf1b02aa09b0af2af767ecc54343798  # v1.2.2-6 (2026-08-14)

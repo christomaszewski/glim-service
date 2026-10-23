@@ -1,0 +1,74 @@
+# Descriptor for the "rig" vehicle-level orchestrator: how to invoke this service's per-instance
+# launcher. Descriptive metadata ONLY -- this repo does NOT depend on rig; rig depends on this repo
+# (one-way). rig invokes:  <launcher> <config> <mapped-verb>   e.g.  glim-up <config> up -d
+service: glim
+launcher: glim-up
+# Graph CONSUMER: up after every sensor, down FIRST (the decider dies before its eyes).
+tier: autonomy
+verbs:
+  up: "up -d"
+  down: "down"       # the supervisor saves the session's map before the container exits
+  status: "ps"       # rig may append `--format json` to parse `docker compose ps`
+  logs: "logs"
+  config: "config"
+  images: "images"
+  runtime-images: "runtime-images"
+  # Operational-state contract (all three or none — declaring them IS the support claim). The
+  # launcher handles these itself (never compose subcommands): standby = GLIM stopped with the
+  # session's map saved, supervisor + health still reporting; activate starts a NEW mapping
+  # session; state prints {"state": active|standby|transitioning|down, "detail": ...} on stdout.
+  # `up` honors RIG_TARGET_STATE > config `initial_state` > active. Mission software may drive
+  # the same states through the supervisor's ROS lifecycle node (/<ns>/glim_supervisor).
+  standby: "standby"
+  activate: "activate"
+  state: "state"
+ros_distro: lyrical
+
+# Example config `rig init` / `rig fetch` / `rig add` scaffold new instances from. Declaring it makes
+# the linkage contractual: registry consumers reach it through the pinned source.repo+rev.
+examples:
+  - autonomy/glim.example.yaml
+
+# rig's BUILD phase: `rig build` runs <command> <registry> [tag] (cwd = this repo) to build + push
+# the runtime image. `rig certify` checks the compose pulls exactly these images from
+# RIG_IMAGE_REGISTRY tagged :RIG_IMAGE_TAG (build/pull agreement).
+build:
+  command: tools/build_image.sh
+  images: [glim]
+  architectures: [arm64, amd64]
+  capabilities: {no_cache: true, platforms: true}
+
+# One CPU runtime per architecture (GLIM's CPU estimation modules). Rig injects the catalog digest
+# through the same full-image override the deploy compose already uses.
+images:
+  override_env: {glim: GLIM_IMAGE}
+
+# `rig replay <run> <instance>`: the launcher wires use_sim_time from RIG_SIM_TIME (config
+# `ros.use_sim_time` wins both ways), so a replayed session estimates on bag time.
+replay:
+  sim_time: true
+
+# No `msgs:` block: every published type is in ros-base/common_interfaces (nav_msgs,
+# geometry_msgs, sensor_msgs, tf2_msgs, diagnostic_msgs, lifecycle_msgs).
+#
+# No `interface:` block: GLIM's subscriptions are per-instance configuration (the lidar and IMU
+# instances it is wired to), so a service-level declaration would WARN on every observed run.
+# Outputs are fixed — /<ns>/glim_ros/{odom,pose,points,aligned_points,map,...}, /tf, /diagnostics —
+# see README "ROS interface"; `rig graph --contract <instance>` prints the observed contract.
+
+# Per-instance fallback map store, always mounted; map sessions land in it only when no data dir is
+# exported (standalone runs without GLIM_DATA_DIR, or a vehicle without data_dir — with one, maps go
+# to <data_dir>/current/maps/<name>/). rig removes it ONLY on final teardown (`rig down --purge`):
+# maps in it are lost then, so set data_dir for anything worth keeping. {name} = instance.
+external_volumes:
+  - "glim_{name}_maps"
+
+# Files rig vendors onto the vehicle to run this service (the deployable "launch surface"). The
+# runtime itself is the published image, so NO build context belongs here. rigging.yaml itself is
+# always vendored by rig, and declared examples are auto-vendored.
+launch_surface:
+  - glim-up
+  - tools/render_config.py
+  - tools/runtime_images.py
+  - docker/compose/compose.deploy.yaml
+  - docker/compose/compose.datadir.yaml

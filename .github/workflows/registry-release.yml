@@ -1,0 +1,86 @@
+# On every published GitHub release (tag vX.Y.Z) update this service's entry in the public rig
+# registry: rewrite services/glim/manifest.yaml (version + source.rev), regenerate index.json
+# with the registry's own tooling, push. The manifest is OWNED by this workflow — it rewrites the
+# file wholesale, so registry-side hand edits to it do not survive the next release.
+#
+# One-time setup: a RIG_REGISTRY_TOKEN Actions secret in THIS repo — fine-grained PAT scoped to
+# christomaszewski/rig-registry-public with Contents read/write, nothing else.
+name: registry-release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+# Serialize releases — two concurrent runs would race the registry push.
+concurrency:
+  group: registry-release
+
+jobs:
+  update-registry:
+    runs-on: ubuntu-latest
+    steps:
+      - name: derive version from tag
+        id: meta
+        run: |
+          echo "${GITHUB_REF_NAME}" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$' || {
+            echo "::error::release tag '${GITHUB_REF_NAME}' is not vX.Y.Z — registry versions are exact X.Y.Z"
+            exit 1
+          }
+          echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          repository: christomaszewski/rig-registry-public
+          token: ${{ secrets.RIG_REGISTRY_TOKEN }}
+          path: registry
+
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12"}
+
+      - name: install rig (registry validate/index tooling)
+        run: pip install git+https://github.com/christomaszewski/rig
+
+      # GITHUB_SHA on a release event is the tagged commit — exactly the rev consumers should pin.
+      - name: rewrite manifest
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          mkdir -p registry/services/glim
+          cat > registry/services/glim/manifest.yaml <<EOF
+          # AUTO-UPDATED on every glim release by the glim-service repo's registry-release workflow
+          # (rewrites this file wholesale + regenerates index.json). Hand-edits will be clobbered
+          # by the next release — change the workflow in the glim-service repo instead.
+          kind: service
+          name: glim
+          version: ${VERSION}
+          platforms: [linux/amd64, linux/arm64]
+          ros_distro: lyrical
+          instantiable: true            # template service — one config per SLAM instance instantiates it
+          source:
+            repo: https://github.com/christomaszewski/glim-service.git
+            rev: ${GITHUB_SHA}
+          EOF
+
+      - name: regenerate index + validate
+        working-directory: registry
+        run: |
+          ./tools/gen-index
+          ./tools/validate
+
+      - name: commit + push
+        working-directory: registry
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add services/glim/manifest.yaml index.json
+          if git diff --staged --quiet; then
+            echo "registry already current for glim ${VERSION}"
+            exit 0
+          fi
+          git commit -m "glim ${VERSION} (auto: release ${GITHUB_REF_NAME})"
+          git push

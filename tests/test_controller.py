@@ -1,0 +1,371 @@
+"""The supervisor's state machine, process ownership and session records — no ROS, no GLIM."""
+import json
+import os
+from pathlib import Path
+import signal
+import sys
+import tempfile
+import time
+import unittest
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "supervisor"))
+
+from glim_supervisor import controller as ctl  # noqa: E402
+from glim_supervisor import storage  # noqa: E402
+from glim_supervisor.process import GlimProcess  # noqa: E402
+
+INSTANCE = {
+    "version": 1, "service": "glim", "instance": "slam", "namespace": "/slam",
+    "use_sim_time": False, "pipeline": "lightweight",
+    "inputs": {"points": "/top/points", "imu": "/ins_main/imu/data"},
+    "glim": {"glim_ros": {"points_topic": "/top/points"}},
+    "map": {"save_timeout_s": 5.0},
+    "health": {"interval_s": 1.0, "stale_after_s": 5.0, "stall_timeout_s": 5.0, "limits": {}},
+}
+
+
+class FakeProcess:
+    """Stands in for GlimProcess; tests flip `alive` / `exit_code` to simulate GLIM."""
+    instances = []
+
+    def __init__(self, command, clock):
+        self.command = command
+        self.clock = clock
+        self.alive = False
+        self.exit_code = None
+        self.started_at = None
+        self.stop_outcome = ("saved", 0)
+        self.dump = Path(command[command.index("-p", 6) + 1].split(":=", 1)[1])
+        FakeProcess.instances.append(self)
+
+    def start(self):
+        self.alive, self.started_at = True, self.clock()
+
+    def running(self):
+        return self.alive
+
+    def returncode(self):
+        return None if self.alive else self.exit_code
+
+    def uptime(self):
+        return 0.0 if self.started_at is None else self.clock() - self.started_at
+
+    def crash(self, code):
+        self.alive, self.exit_code = False, code
+
+    def stop(self, save_timeout_s):
+        if self.alive and self.stop_outcome[0] == "saved":
+            self.dump.mkdir(parents=True, exist_ok=True)
+            (self.dump / "graph.txt").write_text("map")
+        self.alive, self.exit_code = False, self.stop_outcome[1]
+        return self.stop_outcome
+
+
+class Clock:
+    def __init__(self):
+        self.now = 1000.0
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
+
+
+def fake_compose(defaults_dir, instance, session_dir):
+    config_dir = Path(session_dir) / "config"
+    config_dir.mkdir(parents=True)
+    (config_dir / "config.json").write_text("{}")
+    return config_dir, []
+
+
+class ControllerTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.map_root = self.root / "data"
+        self.map_root.mkdir()
+        self.clock = Clock()
+        FakeProcess.instances = []
+        self.compose = ctl.glimconfig.compose
+        ctl.glimconfig.compose = fake_compose
+        self.addCleanup(setattr, ctl.glimconfig, "compose", self.compose)
+
+    def make(self, initial="active", **kwargs):
+        controller = ctl.Controller(
+            INSTANCE, defaults_dir=self.root, map_root=self.map_root,
+            target_file=self.root / "state/target", initial=initial,
+            process_factory=lambda command: FakeProcess(command, self.clock),
+            clock=self.clock, wall=lambda: 1792000000.0, startup_timeout_s=10, **kwargs)
+        # blocking waits use stop_event.wait; advance the fake clock instead of sleeping
+        controller._pause = lambda seconds: self.clock.advance(seconds)
+        return controller
+
+    def session_record(self, process):
+        return json.loads((process.dump.parent / "session.json").read_text())
+
+    def test_activate_starts_a_session_and_waits_until_ready(self):
+        controller = self.make(initial="standby")
+        self.assertEqual(controller.state()["state"], "standby")
+        controller.transition("active")
+        process, = FakeProcess.instances
+        self.assertEqual(controller.state()["state"], "active")
+        self.assertIn("__ns:=/slam", process.command)
+        self.assertIn("use_sim_time:=false", process.command)
+        session_dir = process.dump.parent
+        self.assertEqual(session_dir.parent, self.map_root / "maps" / "slam")
+        self.assertEqual(session_dir.name, "20261014T174640Z")
+        record = self.session_record(process)
+        self.assertEqual((record["outcome"], record["pipeline"]), ("running", "lightweight"))
+        self.assertEqual((self.root / "state/target").read_text().strip(), "active")
+
+    def test_standby_saves_the_map_and_records_the_outcome(self):
+        controller = self.make()
+        controller.transition("active")
+        process, = FakeProcess.instances
+        controller.transition("standby")
+        state = controller.state()
+        self.assertEqual(state["state"], "standby")
+        self.assertIn("saved", state["detail"])
+        record = self.session_record(process)
+        self.assertEqual((record["outcome"], record["map_saved"], record["exit_code"]), ("saved", True, 0))
+
+    def test_each_activation_is_a_new_session(self):
+        controller = self.make()
+        controller.transition("active")
+        controller.transition("standby")
+        controller.transition("active")
+        first, second = FakeProcess.instances
+        self.assertNotEqual(first.dump.parent, second.dump.parent)
+        self.assertEqual(second.dump.parent.name, "20261014T174640Z_2")
+
+    def test_run_pointer_is_pinned_at_session_start(self):
+        run = self.map_root / "runs" / "20261022_field"
+        run.mkdir(parents=True)
+        (self.map_root / "current").symlink_to(Path("runs") / run.name)
+        controller = self.make()
+        controller.transition("active")
+        self.assertEqual(FakeProcess.instances[0].dump.parent.parent, run.resolve() / "maps" / "slam")
+
+    def test_pointer_outside_the_mount_falls_back_to_flat_layout(self):
+        outside = self.root / "elsewhere"
+        outside.mkdir()
+        (self.map_root / "current").symlink_to(outside)
+        self.assertEqual(storage.instance_root(self.map_root, "slam"), self.map_root / "maps" / "slam")
+
+    def test_unexpected_exit_restarts_with_backoff_then_turns_unhealthy(self):
+        controller = self.make()
+        controller.transition("active")
+        for attempt in range(1, 4):
+            FakeProcess.instances[-1].crash(-11)
+            controller.tick()
+            state = controller.state()
+            self.assertEqual(state["state"], "transitioning")
+            self.assertIn("restarting in", state["detail"])
+            self.assertEqual(len(FakeProcess.instances), attempt)   # no restart before backoff
+            self.clock.advance(2 ** attempt + 0.1)
+            controller.tick()
+            self.assertEqual(len(FakeProcess.instances), attempt + 1)
+        self.assertEqual(controller.restarts, 3)
+        self.assertFalse(controller.health()[0])
+        crashed = self.session_record(FakeProcess.instances[0])
+        self.assertEqual((crashed["outcome"], crashed["exit_code"]), ("exited", -11))
+        # a session that stays up clears the failure streak
+        self.clock.advance(61)
+        controller.tick()
+        self.assertTrue(controller.health()[0])
+        self.assertEqual(controller.state()["state"], "active")
+
+    def test_operator_activate_skips_the_backoff(self):
+        controller = self.make()
+        controller.transition("active")
+        FakeProcess.instances[-1].crash(1)
+        controller.tick()
+        controller.transition("active")
+        self.assertEqual(len(FakeProcess.instances), 2)
+        self.assertEqual(controller.state()["state"], "active")
+
+    def test_exit_during_startup_fails_the_transition_but_keeps_the_target(self):
+        controller = self.make(initial="standby")
+        original = FakeProcess.start
+
+        def start_and_die(process):
+            original(process)
+            process.crash(134)
+        FakeProcess.start = start_and_die
+        self.addCleanup(setattr, FakeProcess, "start", original)
+        with self.assertRaisesRegex(RuntimeError, "exited during startup"):
+            controller.transition("active")
+        self.assertEqual(controller.target, "active")
+        self.assertEqual(controller.failures, 1)
+
+    def test_compose_failure_records_the_session(self):
+        controller = self.make(initial="standby")
+
+        def broken(*_):
+            raise ValueError("no `glim_ros` section")
+        ctl.glimconfig.compose = broken
+        with self.assertRaisesRegex(RuntimeError, "failed to start"):
+            controller.transition("active")
+        session_dir, = (self.map_root / "maps/slam").iterdir()
+        record = json.loads((session_dir / "session.json").read_text())
+        self.assertEqual(record["outcome"], "failed_to_start")
+
+    def test_ready_probe_gates_active(self):
+        controller = self.make(initial="standby")
+        controller.ready_probe = lambda: False
+        with self.assertRaisesRegex(RuntimeError, "not visible on the ROS graph"):
+            controller.transition("active")
+        self.assertEqual(controller.state()["state"], "transitioning")
+        controller.ready_probe = lambda: None   # graph unknown -> trust the process
+        self.assertEqual(controller.state()["state"], "active")
+
+    def test_target_survives_a_supervisor_restart(self):
+        controller = self.make()
+        controller.transition("standby")
+        self.assertEqual(self.make(initial="active").target, "standby")
+
+    def test_failed_standby_save_fails_the_transition(self):
+        controller = self.make()
+        controller.transition("active")
+        FakeProcess.instances[-1].stop_outcome = ("save_timeout", -9)
+        with self.assertRaisesRegex(RuntimeError, "not saved cleanly"):
+            controller.transition("standby")
+        self.assertEqual(controller.state()["state"], "standby")   # GLIM is stopped regardless
+        self.assertIn("save_timeout", controller.snapshot()["save_error"])
+
+    def test_stop_after_a_failed_in_flight_save_is_not_clean(self):
+        controller = self.make()
+        controller.transition("active")
+        process = FakeProcess.instances[-1]
+        process.stop_outcome = ("failed", 1)
+        original = process.stop
+
+        def stop_during_shutdown(budget):
+            controller.stop_event.set()        # docker stop arrives while standby is saving
+            return original(budget)
+        process.stop = stop_during_shutdown
+        with self.assertRaises(RuntimeError):
+            controller.transition("standby")
+        self.assertFalse(controller.shutdown())
+
+    def test_unwritable_map_root_is_a_counted_failure(self):
+        controller = self.make(initial="standby")
+        original = storage.new_session_dir
+
+        def denied(*_):
+            raise PermissionError(13, "Permission denied", str(self.map_root))
+        ctl.storage.new_session_dir = denied
+        self.addCleanup(setattr, ctl.storage, "new_session_dir", original)
+        with self.assertRaisesRegex(RuntimeError, "failed to start: .*Permission denied"):
+            controller.transition("active")
+        for _ in range(2):
+            self.clock.advance(100)
+            controller.tick()
+        self.assertEqual(controller.failures, 3)
+        self.assertFalse(controller.health()[0])
+        self.assertIn("Permission denied", controller.state()["detail"])
+
+    def test_lifecycle_style_activate_reverts_on_failure(self):
+        controller = self.make(initial="standby")
+        original = FakeProcess.start
+
+        def start_and_die(process):
+            original(process)
+            process.crash(134)
+        FakeProcess.start = start_and_die
+        self.addCleanup(setattr, FakeProcess, "start", original)
+        with self.assertRaises(RuntimeError):
+            controller.transition("active", revert_on_failure=True)
+        self.assertEqual(controller.target, "standby")
+        self.assertEqual((self.root / "state/target").read_text().strip(), "standby")
+        self.clock.advance(100)
+        controller.tick()
+        self.assertEqual(len(FakeProcess.instances), 1)   # nothing restarts it
+
+    def test_shutdown_saves_and_reports_failures(self):
+        controller = self.make()
+        controller.transition("active")
+        self.assertTrue(controller.shutdown())
+        controller = self.make()
+        controller.tick()
+        FakeProcess.instances[-1].stop_outcome = ("save_timeout", -9)
+        self.assertFalse(controller.shutdown())
+        self.assertEqual(controller.state()["state"], "transitioning")
+
+    def test_transitions_do_not_queue(self):
+        controller = self.make()
+
+        class Busy:  # another transition holds the lock past the bounded wait
+            def acquire(self, blocking=True, timeout=-1):
+                return False
+        controller.lock = Busy()
+        with self.assertRaisesRegex(RuntimeError, "transition in progress"):
+            controller.transition("standby")
+        controller.tick()   # the supervise loop just skips its turn
+        self.assertEqual(controller.target, "active")
+
+    def test_state_vocabulary(self):
+        controller = self.make()
+        seen = {controller.state()["state"]}
+        controller.transition("active")
+        seen.add(controller.state()["state"])
+        controller.transition("standby")
+        seen.add(controller.state()["state"])
+        self.assertLessEqual(seen, {"active", "standby", "transitioning"})
+
+
+class GlimProcessTests(unittest.TestCase):
+    """The real process wrapper against stand-in programs."""
+
+    def program(self, body):
+        return [sys.executable, "-c", "import signal, sys, time\n" + body]
+
+    def test_sigint_lets_the_process_save(self):
+        process = GlimProcess(self.program(
+            "signal.signal(signal.SIGINT, lambda *_: sys.exit(0))\n"
+            "print('ready', flush=True)\ntime.sleep(60)"))
+        process.start()
+        time.sleep(0.5)
+        self.assertTrue(process.running())
+        self.assertEqual(process.stop(5), ("saved", 0))
+
+    def test_escalates_past_the_save_budget(self):
+        process = GlimProcess(self.program(
+            "signal.signal(signal.SIGINT, signal.SIG_IGN)\ntime.sleep(60)"))
+        process.start()
+        time.sleep(0.5)
+        outcome, code = process.stop(0.5)
+        self.assertEqual(outcome, "save_timeout")
+        self.assertEqual(code, -signal.SIGTERM)
+
+    def test_already_exited(self):
+        process = GlimProcess([sys.executable, "-c", "raise SystemExit(3)"])
+        process.start()
+        process.popen.wait()
+        self.assertEqual(process.stop(1), ("exited", 3))
+
+    def test_nonzero_exit_on_save_is_a_failure(self):
+        process = GlimProcess(self.program(
+            "signal.signal(signal.SIGINT, lambda *_: sys.exit(4))\ntime.sleep(60)"))
+        process.start()
+        time.sleep(0.5)
+        self.assertEqual(process.stop(5), ("failed", 4))
+
+
+class OwnershipTests(unittest.TestCase):
+    @unittest.skipUnless(hasattr(os, "geteuid") and os.geteuid() == 0, "needs root to chown")
+    def test_session_files_follow_the_data_dir_owner(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            os.chown(root, 4242, 4242)
+            (root / "s" / "dump").mkdir(parents=True)
+            (root / "s" / "dump" / "graph.txt").write_text("x")
+            storage.adopt_ownership(root / "s", root)
+            self.assertEqual((root / "s/dump/graph.txt").stat().st_uid, 4242)
+
+
+if __name__ == "__main__":
+    unittest.main()

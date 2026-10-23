@@ -1,0 +1,5 @@
+#!/bin/sh
+# Client of the in-container supervisor: state | standby | activate | health. Used by the
+# launcher's operational-state verbs (`docker compose exec ... glim-statectl <verb>`) and by the
+# image HEALTHCHECK. The supervisor owns every transition; this only asks.
+exec python3 -m glim_supervisor "${1:?usage: glim-statectl state|standby|activate|health}"

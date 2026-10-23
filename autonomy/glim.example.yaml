@@ -1,0 +1,125 @@
+# GLIM rig service config: wrapper settings plus opaque GLIM overrides.
+# Copy per SLAM instance, then invoke: ./glim-up autonomy/slam.yaml up -d
+# Wrapper schema: tools/render_config.py. GLIM's own parameters (the `glim:` block) default to the
+# pinned upstream config files (glim.repos); see https://koide3.github.io/glim/parameters/ and the
+# commented JSON in the image at /opt/glim/share/glim/config/.
+#
+# Before the first real run, check the two things GLIM cannot detect for you:
+#   1. extrinsics.T_lidar_imu matches the physical mounting (below).
+#   2. Lidar and IMU stamps share ONE clock. Ouster's default TIME_FROM_INTERNAL_OSC counts from
+#      sensor power-on, so pair it with the SBG only after PTP sync (TIME_FROM_PTP_1588), or use
+#      TIME_FROM_ROS_TIME on the lidar together with the SBG's default time.source: receive_time.
+
+service: glim
+name: slam                      # rig instance / health identity; standalone project glim_slam
+# service/name/ros.namespace must match [a-z][a-z0-9_]*. Rig can supply name from vehicle.yaml.
+
+# up target: RIG_TARGET_STATE > initial_state > active. Choices: active | standby.
+# active = mapping. standby = GLIM stopped with its session's map saved; the supervisor, health
+# and ROS lifecycle node stay up. Every activation starts a NEW session (a fresh map).
+# initial_state: standby         # trigger-style: wait for `rig activate` or a mission's lifecycle call
+
+ros:
+  # namespace: slam             # defaults to name: /slam/glim_ros/odom, /slam/glim_supervisor, ...
+  # use_sim_time: false         # omit to follow rig replay (RIG_SIM_TIME); explicit true/false wins
+
+# The sensor topics GLIM subscribes to. Absolute names are recommended; relative ones resolve under
+# ros.namespace.
+inputs:
+  points:
+    topic: /top/points          # ouster instance `top` (point_type original carries the
+                                # per-point `t` GLIM deskews with; xyz/xyzi do not)
+    # qos: sensor_data          # profile name, or {profile, depth, reliability, durability, history};
+                                # keys you omit keep GLIM's defaults
+  imu:
+    topic: /ins_main/imu/data   # sbg instance `ins_main` (sensor_msgs/Imu, m/s^2 and rad/s)
+    # qos: {profile: sensor_data, depth: 1000}   # GLIM's default; IMU runs at hundreds of Hz
+
+# REQUIRED. The IMU pose in the lidar frame, TUM order [x, y, z, qx, qy, qz, qw] in metres:
+# p_lidar = T_lidar_imu * p_imu. Measure it from your mounting drawing or URDF — there is no safe
+# default for an external IMU. The values below are a PLACEHOLDER (IMU 10 cm below the lidar, axes
+# aligned). With the SBG's convention.use_enu: true the IMU frame is FLU (REP-103); with NED output
+# it is FRD and the rotation must say so.
+extrinsics:
+  T_lidar_imu: [0.0, 0.0, -0.10, 0.0, 0.0, 0.0, 1.0]
+
+# TF that GLIM broadcasts: map -> odom -> base (always), and imu -> lidar (optional). A frame can
+# have only ONE parent, so decide who owns each edge before enabling this on a vehicle.
+frames:
+  map: map
+  odom: odom
+  base: ""                      # "" = GLIM's tracked frame is the IMU frame itself (odom -> imu_link
+                                # here). Set base_link only when a static <imu> -> base_link transform
+                                # exists (URDF): GLIM then owns odom -> base_link, so turn OFF the
+                                # SBG's tf.broadcast_odom_to_base.
+  # imu: ""                     # "" = header.frame_id of the IMU messages
+  # lidar: ""                   # "" = header.frame_id of the point clouds
+  publish_imu_to_lidar: false   # true only if nothing else (URDF, the Ouster's static TF) connects
+                                # the lidar frame; otherwise the lidar frame gets a second parent
+
+# GLIM module preset (all CPU — this image is built without CUDA):
+#   lightweight  odometry_cpu + sub_mapping_passthrough + global_mapping_pose_graph (real-time on an
+#                embedded CPU; loop closure by pose-graph)            [default]
+#   cpu          odometry_cpu + sub_mapping_cpu + global_mapping_cpu (VGICP global refinement;
+#                more accurate, much heavier)
+#   odometry     odometry_cpu only — no submaps, no global map, nothing to save on stop
+pipeline: lightweight
+
+# Opaque per-module overrides, merged over the pinned upstream defaults for the selected pipeline.
+# Modules: ros, sensors, preprocess, odometry, sub_mapping, global_mapping. Keys this wrapper derives
+# (topics, QoS, frames, T_lidar_imu, so_name, enable_*_mapping) are rejected here. Keys absent from
+# the upstream defaults are applied but reported as a WARN on /diagnostics (typo guard).
+glim:
+  sensors:
+    # IMU noise densities; GLIM's defaults suit MEMS IMUs. Tighten for a tactical-grade unit.
+    imu_acc_noise: 0.05         # m/s^2/sqrt(Hz)
+    imu_gyro_noise: 0.02        # rad/s/sqrt(Hz)
+  preprocess:
+    distance_near_thresh: 1.0   # m; drop returns from the vehicle itself
+    distance_far_thresh: 100.0
+    random_downsample_target: 10000   # fewer points = faster (e.g. 5000 on a busy CPU)
+    num_threads: 2
+  # odometry:
+  #   ivox_resolution: 1.0      # outdoors 1.0 m; indoors 0.25-0.5
+  #   num_threads: 4
+  # ros:
+  #   acc_scale: 0.0            # 0 = auto-detect m/s^2 vs g from the first IMU sample
+  #   imu_time_offset: 0.0      # s, added to IMU stamps
+
+# Map sessions: <data dir>/current/maps/<name>/<session>/ when rig exports RIG_DATA_DIR and a run is
+# open (flat <data dir>/maps/<name>/<session>/ otherwise), else the glim_<name>_maps volume. Each
+# session holds session.json, the exact GLIM config used, GLIM's logs and its dump/ (open it with
+# GLIM's offline_viewer). GLIM finishes optimizing and saves on standby/down; this bounds that.
+map:
+  save_timeout_s: 240           # also sizes the container stop grace period (+30 s)
+
+# Health on /diagnostics (fleet contract, ouster docs/SERVICE_HEALTH.md): components service,
+# odometry, imu, points and storage under "<name>: <component>". Stalls only WARN by default.
+health:
+  interval_s: 1                 # heartbeat period
+  stall_timeout_s: 5            # silence on odometry / IMU while active that counts as stalled
+  # expected_odometry_hz: 10    # lidar frame rate; reported as fps.expected
+  limits: {}
+  # limits:                     # producer-side thresholds; strict > / <, ERROR wins over WARN
+  #   odometry: {fps.delivered: {warn_below: 8.0}, frame_age_s: {error_above: 10.0}}
+  #   imu: {fps.delivered: {warn_below: 100.0}}
+  #   storage: {disk.free_gb: {warn_below: 20.0, error_below: 5.0}}
+
+# Zenoh session settings (only consumed with RMW_IMPLEMENTATION=rmw_zenoh_cpp), the same block the
+# ouster wrapper and bag logger take. Point clouds are the largest messages on the vehicle: enable
+# SHM on BOTH ends (here and on the ouster instance) or every scan is copied over TCP loopback.
+# zenoh:
+#   shared_memory: true
+#   shm_pool_mb: 256
+#   overrides: {}
+
+# Deployment/launcher environment (NOT additional instance-YAML fields):
+#   VEHICLE_ID                  fleet identity on /diagnostics (rig supplies it)
+#   ROS_DOMAIN_ID, RMW_IMPLEMENTATION, ZENOH_CONFIG_OVERRIDE   fleet ROS env (rig supplies it)
+#   RIG_TARGET_STATE            optional up target, active | standby, overrides initial_state
+#   RIG_SIM_TIME                rig replay's clock token -> use_sim_time (unless ros.use_sim_time)
+#   RIG_DATA_DIR / GLIM_DATA_DIR  host data dir for map sessions (rig / standalone)
+#   GLIM_IMAGE                  full image override; else [RIG_IMAGE_REGISTRY/]glim:RIG_IMAGE_TAG
+#   COMPOSE_PROJECT_NAME        rig-supplied project; standalone defaults to glim_<name>
+#   GLIM_PYTHON                 launcher Python interpreter (default python3; requires PyYAML)
+#   GLIM_SETTLE_TIMEOUT         detached up convergence timeout (s; default stop grace + 60)

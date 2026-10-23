@@ -1,0 +1,237 @@
+#!/usr/bin/env bash
+# glim-up <glim-config.yaml> [up [-d] | down | status | logs [args] | config | standby | activate | state | ...]
+#
+# Bring up ONE GLIM lidar-inertial SLAM instance from ONE rig config (the single source of truth).
+# Reads the config, derives the instance identity (ROS namespace /<ns>; compose project = an
+# inherited COMPOSE_PROJECT_NAME — rig owns it — or glim_<name> standalone), renders the instance
+# file the in-container supervisor turns into GLIM's JSON config, and runs `docker compose`. It
+# SELECTS + PARAMETERIZES static compose files — it never generates one.
+#
+#   glim-up autonomy/slam.yaml up -d         # detached; waits until the target state is reached
+#   glim-up autonomy/slam.yaml status        # docker compose ps
+#   glim-up autonomy/slam.yaml logs -f
+#   glim-up autonomy/slam.yaml down          # saves the session's map, then removes the container
+#   glim-up autonomy/slam.yaml config        # render the merged compose
+#   glim-up autonomy/slam.yaml standby       # save the map, stop GLIM; container stays up
+#   glim-up autonomy/slam.yaml activate      # start a NEW mapping session
+#   glim-up autonomy/slam.yaml state         # {"state": ...} JSON on stdout (read-only)
+#
+# Multiple instances = run it per config; each is its own compose project + ROS namespace, so
+# instances never collide. This repo does NOT depend on rig (one-way; see rigging.yaml).
+set -euo pipefail
+REPO="$(cd "$(dirname "$0")" && pwd)"
+PYTHON="${GLIM_PYTHON:-python3}"
+
+CONFIG="${1:?usage: glim-up <glim-config.yaml> [up [-d]|down|status|logs|config|standby|activate|state|...]}"
+shift || true
+[ -f "$CONFIG" ] || { echo "glim-up: config not found: $CONFIG" >&2; exit 1; }
+CONFIG_ABS="$(cd "$(dirname "$CONFIG")" && pwd)/$(basename "$CONFIG")"
+
+if ! docker compose version >/dev/null 2>&1; then
+  echo "glim-up: needs the Docker Compose v2 plugin ('docker compose')" >&2
+  exit 1
+fi
+
+# Verbs: `status` -> `ps`; standby/activate/state are the operational-state contract (handled
+# below, NOT compose subcommands); everything else is forwarded to `docker compose` verbatim.
+# No args = up.
+ARGS=("$@")
+[ ${#ARGS[@]} -eq 0 ] && ARGS=(up)
+[ "${ARGS[0]}" = "status" ] && ARGS=(ps "${ARGS[@]:1}")
+STATE_VERB=""
+case "${ARGS[0]}" in standby|activate|state) STATE_VERB="${ARGS[0]}";; esac
+
+# Image planning runs before per-vehicle identity is resolved (fleet artifacts), so it must not
+# read or validate the instance config. Placeholders satisfy Compose's non-image fields; image
+# selection comes entirely from the compose file and the image environment.
+case "${ARGS[0]}" in
+  runtime-images|images)
+    export COMPOSE_PROJECT_NAME=glim_image_query GLIM_NAME=image_query
+    export GLIM_INSTANCE_HOST="$REPO/var/run/image-query.instance.json"
+    export GLIM_TARGET_HOST="$REPO/var/run/image-query.target"
+    exec "$PYTHON" "$REPO/tools/runtime_images.py" "${ARGS[0]}" \
+      -f "$REPO/docker/compose/compose.deploy.yaml" ;;
+esac
+
+# config -> instance identity. Literal NUL-delimited key/value pairs; never eval'd as shell.
+ENV_FILE="$(mktemp)"
+trap 'rm -f "$ENV_FILE"' EXIT
+"$PYTHON" "$REPO/tools/render_config.py" --env0 "$CONFIG_ABS" > "$ENV_FILE"
+while IFS= read -r -d '' key; do
+  IFS= read -r -d '' value || { echo "glim-up: truncated environment data" >&2; exit 1; }
+  case "$key" in
+    SERVICE|NAME|NAMESPACE|INITIAL_STATE|STOP_GRACE_S|ZENOH_OVERRIDE) export "$key=$value" ;;
+    *) echo "glim-up: unexpected environment key: $key" >&2; exit 1 ;;
+  esac
+done < "$ENV_FILE"
+rm -f "$ENV_FILE"
+trap - EXIT
+PROJECT="${SERVICE}_${NAME}"
+
+# Hash the rendered instance file into its bind-mount path: Compose cannot see edits inside a
+# mounted file, so a changed config must change the mount source to recreate the container.
+# Inspection and teardown only compute the path; they never write files a container mounts.
+INSTANCE_HOST="$REPO/var/run/${NAME}.instance.json"
+case "${ARGS[0]}" in
+  up|create|run|config)
+    INSTANCE_CONTENT="$("$PYTHON" "$REPO/tools/render_config.py" --instance --sim-time "${RIG_SIM_TIME:-}" "$CONFIG_ABS")"
+    INSTANCE_HASH="$(printf '%s\n' "$INSTANCE_CONTENT" | "$PYTHON" -c 'import hashlib, sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest()[:16])')"
+    INSTANCE_HOST="$REPO/var/run/${NAME}.${INSTANCE_HASH}.instance.json"
+    ;;
+esac
+
+# Compose env. The image is resolved by the compose file itself (GLIM_IMAGE override ->
+# RIG_IMAGE_REGISTRY -> local glim:latest), so a standalone run needs no rig and no registry.
+export GLIM_INSTANCE_HOST="$INSTANCE_HOST"
+# The startup target travels in a mounted file at a FIXED path, not in the environment: Compose
+# recreates a container whose environment changed, so `rig up` after `rig activate` would otherwise
+# end the running mapping session and start a new one. A running container converges below instead.
+TARGET_HOST="$REPO/var/run/${NAME}.target"
+export GLIM_TARGET_HOST="$TARGET_HOST"
+export GLIM_NAME="$NAME"
+export GLIM_NAMESPACE="$NAMESPACE"
+export GLIM_STOP_GRACE="${STOP_GRACE_S}s"
+export GLIM_ZENOH_OVERRIDE="$ZENOH_OVERRIDE"
+
+FILES=(-f "$REPO/docker/compose/compose.deploy.yaml")
+# Map storage: the vehicle data dir when rig exports one (run-aware: the supervisor writes under
+# <data_dir>/current/maps/<name>/ when a run is open), else GLIM_DATA_DIR for standalone use, else
+# the per-instance glim_<name>_maps volume the base compose always mounts.
+DATA_HOST="${RIG_DATA_DIR:-${GLIM_DATA_DIR:-}}"
+# Compose resolves a relative bind source against the compose file's directory, not the caller's.
+case "$DATA_HOST" in ""|/*) ;; *) DATA_HOST="$PWD/$DATA_HOST" ;; esac
+if [ -n "$DATA_HOST" ]; then
+  export GLIM_DATA_HOST="$DATA_HOST"
+  FILES+=(-f "$REPO/docker/compose/compose.datadir.yaml")
+fi
+
+# rig owns the compose project name (it exports COMPOSE_PROJECT_NAME per call); honor it when
+# inherited, fall back to <service>_<name> standalone. NEVER pass -p — overriding the
+# orchestrator's project name orphans the containers from `rig status`/`rig down`.
+export COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-$PROJECT}"
+
+# --- operational-state verbs (rigging.yaml contract) -------------------------------------------
+# Implemented by the in-container supervisor; the launcher only answers the no-container cases
+# compose exec cannot reach. Stdout discipline: only `state` JSON on stdout, human lines on stderr.
+if [ -n "$STATE_VERB" ]; then
+  RUNNING="$(docker compose "${FILES[@]}" ps -q glim)" \
+    || { echo "glim-up: cannot query compose project $COMPOSE_PROJECT_NAME" >&2; exit 1; }
+  if [ -z "$RUNNING" ]; then
+    if [ "$STATE_VERB" = "state" ]; then
+      ALL="$(docker compose "${FILES[@]}" ps -aq glim)" \
+        || { echo "glim-up: cannot query compose project $COMPOSE_PROJECT_NAME" >&2; exit 1; }
+      DETAIL="no containers"
+      [ -n "$ALL" ] && DETAIL="container present but not running"
+      printf '{"state": "down", "detail": "%s"}\n' "$DETAIL"
+      exit 0
+    fi
+    echo "glim-up: $STATE_VERB: project $COMPOSE_PROJECT_NAME is down (no running glim container) — transitions never create containers; run 'up' first" >&2
+    exit 1
+  fi
+  exec docker compose "${FILES[@]}" exec -T glim glim-statectl "$STATE_VERB"
+fi
+
+# The supervisor receives the initial target BEFORE it starts GLIM, so a standby startup never
+# opens a mapping session just to close it again.
+TARGET_STATE="$INITIAL_STATE"
+if [ "${ARGS[0]}" = "up" ] && [ -n "${RIG_TARGET_STATE:-}" ]; then
+  case "$RIG_TARGET_STATE" in
+    standby|active) TARGET_STATE="$RIG_TARGET_STATE" ;;
+    *) echo "glim-up: RIG_TARGET_STATE='$RIG_TARGET_STATE' must be 'standby' or 'active'" >&2; exit 1 ;;
+  esac
+fi
+
+if [ "${ARGS[0]}" = up ] && [ "${RIG_RUNTIME_IMAGE_PINS+x}" ]; then
+  # Validate the complete active model before writing files or creating storage.
+  "$PYTHON" "$REPO/tools/runtime_images.py" validate-pins "${FILES[@]}" -- "${ARGS[@]:1}"
+fi
+case "${ARGS[0]}" in
+  up|create|run|config)
+    # Bake needs the rendered file bind; queries above only calculate its path. Atomic replace:
+    # a container restarting mid-write must never read a truncated instance file.
+    mkdir -p "$REPO/var/run"
+    INSTANCE_TEMP="$(mktemp "$REPO/var/run/.${NAME}.instance.XXXXXX")"
+    TARGET_TEMP="$(mktemp "$REPO/var/run/.${NAME}.target.XXXXXX")"
+    trap 'rm -f "$INSTANCE_TEMP" "$TARGET_TEMP"' EXIT
+    printf '%s\n' "$INSTANCE_CONTENT" > "$INSTANCE_TEMP"
+    printf '%s\n' "$TARGET_STATE" > "$TARGET_TEMP"
+    chmod 0644 "$INSTANCE_TEMP" "$TARGET_TEMP"
+    mv "$INSTANCE_TEMP" "$INSTANCE_HOST"
+    mv "$TARGET_TEMP" "$TARGET_HOST"
+    trap - EXIT
+    ;;
+esac
+# Only startup creates the per-instance fallback map volume; inspection never does.
+[ "${ARGS[0]}" = "up" ] && docker volume create "glim_${NAME}_maps" >/dev/null
+
+# Compose down neither propagates the stopped container's exit status nor keeps its logs. Stop
+# first so a failed map save (non-zero supervisor exit, or SIGKILL past the grace period) is
+# reported, then perform the requested teardown in either case.
+if [ "${ARGS[0]}" = down ]; then
+  CONTAINERS="$(docker compose "${FILES[@]}" ps -aq glim)"
+  STOP_ARGS=(stop)
+  for ((i = 1; i < ${#ARGS[@]}; i++)); do
+    case "${ARGS[i]}" in
+      -t|--timeout)
+        STOP_ARGS+=("${ARGS[i]}" "${ARGS[i+1]:?missing stop timeout}")
+        i=$((i + 1)) ;;
+      --timeout=*|-t[0-9]*) STOP_ARGS+=("${ARGS[i]}") ;;
+    esac
+  done
+  DOWN_EXIT_STATUS=0
+  if [ -n "$CONTAINERS" ]; then
+    docker compose "${FILES[@]}" "${STOP_ARGS[@]}" glim
+    for container in $CONTAINERS; do
+      EXIT_CODE="$(docker inspect --format '{{.State.ExitCode}}' "$container")" || EXIT_CODE=unknown
+      if [ "$EXIT_CODE" != 0 ]; then
+        echo "glim-up: shutdown failed (container $container exit $EXIT_CODE); the session's map may be incomplete" >&2
+        docker logs --tail 40 "$container" >&2 || true
+        DOWN_EXIT_STATUS=1
+      fi
+    done
+  fi
+  docker compose "${FILES[@]}" "${ARGS[@]}" || DOWN_EXIT_STATUS=1
+  exit "$DOWN_EXIT_STATUS"
+fi
+
+echo "glim-up: project=$COMPOSE_PROJECT_NAME namespace=$NAMESPACE instance=$INSTANCE_HOST target=$TARGET_STATE" >&2
+
+DETACHED=""
+for a in "${ARGS[@]:1}"; do case "$a" in -d|--detach) DETACHED=1;; esac; done
+if [ "${ARGS[0]}" != "up" ] || [ -z "$DETACHED" ]; then
+  if [ "${ARGS[0]}" = up ] && [ "${RIG_RUNTIME_IMAGE_PINS+x}" ]; then
+    exec "$PYTHON" "$REPO/tools/runtime_images.py" pinned-up "${FILES[@]}" -- "${ARGS[@]:1}"
+  fi
+  exec docker compose "${FILES[@]}" "${ARGS[@]}"
+fi
+
+if [ "${RIG_RUNTIME_IMAGE_PINS+x}" ]; then
+  "$PYTHON" "$REPO/tools/runtime_images.py" pinned-up "${FILES[@]}" -- "${ARGS[@]:1}"
+else
+  docker compose "${FILES[@]}" "${ARGS[@]}"
+fi
+
+# Converge: a container that already existed keeps its persisted runtime target across restarts,
+# so `up` re-asserts the requested target and waits for the supervisor to confirm it. Standby may
+# include saving a large map, so the default budget covers the configured save timeout.
+SETTLE_BUDGET="${GLIM_SETTLE_TIMEOUT:-$((STOP_GRACE_S + 60))}"
+DEADLINE=$((SECONDS + SETTLE_BUDGET))
+TARGET_VERB=activate
+[ "$TARGET_STATE" = standby ] && TARGET_VERB=standby
+REQUESTED=""
+while :; do
+  STATE_JSON="$(docker compose "${FILES[@]}" exec -T glim glim-statectl state 2>/dev/null)" || STATE_JSON=""
+  case "$STATE_JSON" in
+    *"\"state\": \"$TARGET_STATE\""*) exit 0 ;;
+    *"\"target\": \"$TARGET_STATE\""*) ;;  # converging toward the right target; keep waiting
+    *'"target": '*)
+      if [ -z "$REQUESTED" ]; then
+        docker compose "${FILES[@]}" exec -T glim glim-statectl "$TARGET_VERB" >&2 && REQUESTED=1
+      fi ;;
+  esac
+  if [ "$SECONDS" -ge "$DEADLINE" ]; then
+    echo "glim-up: instance did not reach $TARGET_STATE within ${SETTLE_BUDGET}s (last probe: ${STATE_JSON:-unreachable}) — left up; check 'status' / 'logs'" >&2
+    exit 1
+  fi
+  sleep 2
+done

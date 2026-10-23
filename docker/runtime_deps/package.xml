@@ -1,0 +1,24 @@
+<?xml version="1.0"?>
+<!-- EXEC deps of the wrapper itself (the supervisor and the RMW choice), resolved by rosdep in
+     the runtime stage so nothing here is hand-pinned to a distro package name. GLIM's own shared
+     library dependencies are NOT listed: the build stage derives them from the compiled binaries
+     (ldd -> dpkg -S) and the runtime stage's loader gate proves the set complete. -->
+<package format="3">
+  <name>glim_service_runtime_deps</name>
+  <version>0.1.0</version>
+  <description>Runtime dependencies of the glim-service supervisor</description>
+  <maintainer email="christomaszewski@gmail.com">Chris Tomaszewski</maintainer>
+  <license>Apache-2.0</license>
+
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>lifecycle_msgs</exec_depend>
+  <exec_depend>diagnostic_msgs</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>rmw_fastrtps_cpp</exec_depend>
+  <exec_depend>rmw_zenoh_cpp</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
