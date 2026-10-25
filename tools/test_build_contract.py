@@ -155,6 +155,22 @@ if "--metadata-file" in args:
         # The temporary repo is not a git checkout: identity is explicitly unknown, never borrowed.
         self.assertIn("GLIM_SERVICE_REF=unknown", build)
         self.assertIn("GLIM_SERVICE_REV=unknown", build)
+        self.assertIn("GLIM_SERVICE_CREATED=", build)
+
+    def test_per_commit_args_cannot_invalidate_the_apt_layers(self):
+        # An ARG joins the cache key of every later RUN in its stage: the per-commit identity must
+        # be declared after the runtime stage's last RUN, or every commit re-runs apt.
+        dockerfile = (ROOT / "docker/Dockerfile.runtime").read_text().splitlines()
+        runtime = dockerfile[next(i for i, line in enumerate(dockerfile)
+                                  if line.startswith("FROM base AS runtime")):]
+        last_run = max(i for i, line in enumerate(runtime) if line.startswith("RUN "))
+        for name in ("GLIM_SERVICE_REF", "GLIM_SERVICE_REV", "GLIM_SERVICE_CREATED"):
+            declared = [i for i, line in enumerate(runtime) if line.startswith(f"ARG {name}")]
+            self.assertEqual(len(declared), 1, name)
+            self.assertGreater(declared[0], last_run, f"{name} is declared before a RUN")
+        for i, line in enumerate(dockerfile):
+            if line.startswith("ARG GLIM_SERVICE_"):
+                self.assertGreater(i, len(dockerfile) - len(runtime), "declared outside runtime")
 
 
 if __name__ == "__main__":

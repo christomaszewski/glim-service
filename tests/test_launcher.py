@@ -18,7 +18,11 @@ case "$*" in
   "logs --tail 40"*) echo 'shutdown log evidence' ;;
   *" config --format json")
     echo '{"name": "x", "services": {"glim": {"image": "glim:latest"}}}' ;;
-  *" ps -q glim"|*" ps -aq glim") [ "${RUNNING:-}" = 1 ] && echo container; exit 0 ;;
+  *" ps -q glim"|*" ps -aq glim")
+    if [ "${RUNNING:-}" = 1 ]; then echo container
+    elif [ -f "$CREATED" ]; then echo created-by-up; fi
+    exit 0 ;;
+  *" up -d"*) touch "$CREATED" ;;
   *" exec -T glim glim-statectl state")
     [ "${UNREACHABLE:-}" = 1 ] && exit 1
     read -r state target < "$FAKE_STATE"
@@ -55,7 +59,8 @@ class LauncherTests(unittest.TestCase):
         self.env = {k: v for k, v in os.environ.items()
                     if not k.startswith(("GLIM_", "RIG_", "COMPOSE_"))}
         self.env.update(PATH=f"{self.bin}:{self.env['PATH']}", ARGV_LOG=str(self.log),
-                        FAKE_STATE=str(self.state), GLIM_SETTLE_TIMEOUT="4")
+                        FAKE_STATE=str(self.state), GLIM_SETTLE_TIMEOUT="4",
+                        CREATED=str(self.root / "created"))
 
     def run_launcher(self, *args, **env):
         return subprocess.run([str(self.root / "glim-up"), str(self.config), *args],
@@ -111,17 +116,39 @@ class LauncherTests(unittest.TestCase):
         self.run_launcher("config")
         self.assertEqual(len(list((self.root / "var/run").glob("slam.*.instance.json"))), 2)
 
-    def test_up_converges_a_container_parked_by_an_earlier_run(self):
-        self.state.write_text("standby standby\n")
+    def test_bare_up_leaves_a_running_container_at_its_own_target(self):
+        # rig activate (or a mission) moved it; an unrelated `rig up` must not reverse that.
+        self.edit_config("# initial_state: standby", "initial_state: standby")
+        self.state.write_text("active active\n")
         result = self.run_launcher("up", "-d", RUNNING="1")
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("glim-statectl standby", self.log.read_text())
+
+    def test_explicit_target_is_reasserted_on_a_running_container(self):
+        self.state.write_text("standby standby\n")
+        result = self.run_launcher("up", "-d", RUNNING="1", RIG_TARGET_STATE="active")
+        self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("glim-statectl activate", self.log.read_text())
+
+    def test_a_new_container_is_held_to_the_requested_target(self):
+        self.state.write_text("standby standby\n")   # e.g. a stale persisted target
+        result = self.run_launcher("up", "-d")        # no container before: this up creates it
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("glim-statectl activate", self.log.read_text())
+
+    def test_replay_activates_a_trigger_style_instance(self):
+        self.edit_config("# initial_state: standby", "initial_state: standby")
+        self.state.write_text("standby standby\n")
+        result = self.run_launcher("up", "-d", RUNNING="1", RIG_REPLAY_SOURCE="/data/runs/r1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("glim-statectl activate", self.log.read_text())
+        self.assertEqual((self.root / "var/run/glim_slam.target").read_text(), "active\n")
 
     def test_up_reports_a_target_it_cannot_reach(self):
         self.state.write_text("transitioning active\n")
         result = self.run_launcher("up", "-d", RUNNING="1")
         self.assertEqual(result.returncode, 1)
-        self.assertIn("did not reach active", result.stderr)
+        self.assertIn("did not settle", result.stderr)
 
     def test_target_state_precedence(self):
         self.edit_config("# initial_state: standby", "initial_state: standby")
@@ -145,7 +172,43 @@ class LauncherTests(unittest.TestCase):
         self.assertIn("target=active", second)
         self.assertEqual(first.split(" docker ", 1)[1], second.split(" docker ", 1)[1])
         self.assertEqual(list((self.root / "var/run").glob("*.target")),
-                         [self.root / "var/run/slam.target"])
+                         [self.root / "var/run/glim_slam.target"])
+
+    def test_config_never_resets_a_seeded_target(self):
+        self.run_launcher("up", "-d", RUNNING="1", RIG_TARGET_STATE="standby")
+        self.run_launcher("config")   # certify / bake / `rig config`
+        self.assertEqual((self.root / "var/run/glim_slam.target").read_text(), "standby\n")
+
+    def test_seed_is_keyed_by_compose_project(self):
+        self.run_launcher("config", COMPOSE_PROJECT_NAME="slam-vehicle-7")
+        self.run_launcher("config")
+        self.assertEqual(sorted(p.name for p in (self.root / "var/run").glob("*.target")),
+                         ["glim_slam.target", "slam-vehicle-7.target"])
+
+    def test_a_directory_docker_left_at_a_mount_source_is_healed(self):
+        run = self.root / "var/run"
+        (run / "glim_slam.target").mkdir(parents=True)   # what Docker creates for a missing source
+        result = self.run_launcher("config")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((run / "glim_slam.target").is_file())
+        (run / "glim_slam.target").unlink()
+        (run / "glim_slam.target").mkdir()
+        (run / "glim_slam.target" / "keep").write_text("x")
+        result = self.run_launcher("config")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("non-empty directory", result.stderr)
+
+    def test_a_broken_edit_never_strands_a_running_instance(self):
+        text = self.config.read_text()
+        self.config.write_text(text + "inital_state: standby\nzenoh: {shm_pool_mb: -1}\n")
+        for verb in ("down", "status", "state", "logs"):
+            with self.subTest(verb=verb):
+                result = self.run_launcher(verb, RUNNING="1", COMPOSE_PROJECT_NAME="slam-vehicle-7")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("project=slam-vehicle-7", self.calls()[-1])
+        result = self.run_launcher("up", "-d", RUNNING="1")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("inital_state", result.stderr)
 
     def test_relative_data_dir_is_made_absolute(self):
         subprocess.run([str(self.root / "glim-up"), "autonomy/slam.yaml", "config"],

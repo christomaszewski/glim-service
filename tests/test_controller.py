@@ -285,6 +285,104 @@ class ControllerTests(unittest.TestCase):
         controller.tick()
         self.assertEqual(len(FakeProcess.instances), 1)   # nothing restarts it
 
+    def test_activate_waits_for_a_session_tick_already_started(self):
+        controller = self.make()
+        controller.tick()                      # restart begun by the supervise loop
+        controller.ready_probe = lambda: False  # never shows up on the graph
+        with self.assertRaisesRegex(RuntimeError, "not visible on the ROS graph"):
+            controller.transition("active")
+        controller.ready_probe = lambda: True
+        controller.transition("active")         # and returns only once it is ready
+        self.assertEqual(controller.state()["state"], "active")
+
+    def test_crash_just_before_standby_is_a_lost_map(self):
+        controller = self.make()
+        controller.transition("active")
+        FakeProcess.instances[-1].crash(-11)   # no tick in between
+        with self.assertRaisesRegex(RuntimeError, "exited .code -11. before its map was saved"):
+            controller.transition("standby")
+        self.assertIn("before its map was saved", controller.snapshot()["save_error"])
+        self.assertEqual(controller.state()["state"], "standby")
+
+    def test_unreadable_saved_target_falls_back_and_is_rewritten(self):
+        (self.root / "state").mkdir()
+        for garbage in ("", "parked\n", "\x00\x00"):
+            with self.subTest(garbage=garbage):
+                (self.root / "state/target").write_text(garbage)
+                controller = self.make(initial="standby")
+                self.assertEqual(controller.target, "standby")
+                self.assertEqual((self.root / "state/target").read_text(), "standby\n")
+
+    def test_starting_target_is_persisted_for_restarts(self):
+        self.make(initial="standby")
+        self.assertEqual(self.make(initial="active").target, "standby")
+
+    def test_standby_still_stops_glim_when_the_target_cannot_be_saved(self):
+        controller = self.make()
+        controller.transition("active")
+        original = ctl.storage.write_durable
+
+        def full_disk(*_):
+            raise OSError(28, "No space left on device")
+        ctl.storage.write_durable = full_disk
+        self.addCleanup(setattr, ctl.storage, "write_durable", original)
+        with self.assertRaisesRegex(RuntimeError, "could not be saved for restarts"):
+            controller.transition("standby")
+        self.assertEqual(controller.state()["state"], "standby")
+        self.assertEqual(self.session_record(FakeProcess.instances[-1])["outcome"], "saved")
+
+    def test_shutdown_stays_transitioning_while_it_saves(self):
+        controller = self.make()
+        controller.transition("active")
+        process = FakeProcess.instances[-1]
+        seen = []
+        original = process.stop
+
+        def observe(budget):
+            controller.changing.clear()           # an in-flight transition's finally
+            seen.append(controller.state())
+            return original(budget)
+        process.stop = observe
+        self.assertTrue(controller.shutdown())
+        self.assertEqual(seen[0]["state"], "transitioning")
+        self.assertIn("shutting down: saving map", seen[0]["detail"])
+
+    def test_interrupted_session_is_closed_out_on_restart(self):
+        controller = self.make()
+        controller.transition("active")
+        session_dir = FakeProcess.instances[-1].dump.parent   # supervisor "dies" here
+        self.assertEqual(self.session_record(FakeProcess.instances[-1])["outcome"], "running")
+        restarted = self.make()
+        restarted.recover_interrupted()
+        record = json.loads((session_dir / "session.json").read_text())
+        self.assertEqual((record["outcome"], record["map_saved"]), ("interrupted", False))
+        self.assertFalse(restarted.session_marker.exists())
+        restarted.recover_interrupted()   # idempotent
+
+    def test_a_dump_cut_short_is_not_a_saved_map(self):
+        controller = self.make()
+        controller.transition("active")
+        process = FakeProcess.instances[-1]
+        process.dump.mkdir(parents=True)
+        (process.dump / "000000").write_text("partial")
+        process.stop_outcome = ("save_timeout", -9)
+        with self.assertRaises(RuntimeError):
+            controller.transition("standby")
+        self.assertFalse(self.session_record(process)["map_saved"])
+
+    def test_parking_clears_a_crash_loop_and_standby_is_healthy(self):
+        controller = self.make()
+        controller.transition("active")
+        for _ in range(3):
+            FakeProcess.instances[-1].crash(1)
+            controller.tick()
+            self.clock.advance(100)
+            controller.tick()
+        self.assertFalse(controller.health()[0])
+        controller.transition("standby")
+        self.assertTrue(controller.health()[0])
+        self.assertEqual(controller.failures, 0)
+
     def test_shutdown_saves_and_reports_failures(self):
         controller = self.make()
         controller.transition("active")
@@ -346,6 +444,17 @@ class GlimProcessTests(unittest.TestCase):
         process.start()
         process.popen.wait()
         self.assertEqual(process.stop(1), ("exited", 3))
+
+    def test_sigint_before_rclcpp_installs_its_handler_is_not_a_failed_save(self):
+        # A C++ process before rclcpp::init dies by SIGINT itself (Python would raise
+        # KeyboardInterrupt instead), so restore the default action to emulate it exactly.
+        process = GlimProcess([sys.executable, "-c",
+                               "import signal, time\nsignal.signal(signal.SIGINT, signal.SIG_DFL)\n"
+                               "time.sleep(60)"])
+        process.start()
+        time.sleep(0.3)
+        self.assertEqual(process.stop(5), ("not_started", -signal.SIGINT))
+        self.assertTrue(ctl.stopped_cleanly("not_started", -signal.SIGINT))
 
     def test_nonzero_exit_on_save_is_a_failure(self):
         process = GlimProcess(self.program(

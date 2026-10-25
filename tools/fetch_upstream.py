@@ -13,11 +13,13 @@ from pathlib import Path
 import re
 import subprocess
 import tempfile
+import time
 
 import yaml
 
 EXPECTED = ("gtsam", "gtsam_points", "glim", "glim_ros2")
 SHA_RE = re.compile(r"[0-9a-f]{40}")
+FETCH_ATTEMPTS = 3   # a cold image build makes four network fetches; ride out a transient 5xx
 
 
 def run(*args, **kwargs):
@@ -25,10 +27,13 @@ def run(*args, **kwargs):
 
 
 def load_manifest(path):
-    repositories = (yaml.safe_load(Path(path).read_text()) or {}).get("repositories") or {}
-    if set(repositories) != set(EXPECTED):
-        raise ValueError(f"{path} must list exactly {', '.join(EXPECTED)}")
+    document = yaml.safe_load(Path(path).read_text()) or {}
+    repositories = document.get("repositories") if isinstance(document, dict) else None
+    if not isinstance(repositories, dict) or set(repositories) != set(EXPECTED):
+        raise ValueError(f"{path} must list exactly {', '.join(EXPECTED)} under `repositories`")
     for key, spec in repositories.items():
+        if not isinstance(spec, dict):
+            raise ValueError(f"{path}: {key} must be a mapping with type, url, version")
         if spec.get("type") != "git" or not spec.get("url"):
             raise ValueError(f"{path}: {key} must be a git repository with a url")
         if not SHA_RE.fullmatch(str(spec.get("version"))):
@@ -42,7 +47,14 @@ def fetch_one(checkout, url, rev):
     checkout.mkdir(parents=True)
     run("git", "-C", str(checkout), "init", "--quiet")
     run("git", "-C", str(checkout), "remote", "add", "origin", url)
-    run("git", "-C", str(checkout), "fetch", "--quiet", "--depth", "1", "origin", rev)
+    for attempt in range(1, FETCH_ATTEMPTS + 1):
+        try:
+            run("git", "-C", str(checkout), "fetch", "--quiet", "--depth", "1", "origin", rev)
+            break
+        except subprocess.CalledProcessError:
+            if attempt == FETCH_ATTEMPTS:
+                raise
+            time.sleep(2 ** attempt)
     run("git", "-C", str(checkout), "checkout", "--quiet", "--detach", "FETCH_HEAD")
     run("git", "-C", str(checkout), "submodule", "update", "--quiet", "--init", "--recursive",
         "--depth", "1")

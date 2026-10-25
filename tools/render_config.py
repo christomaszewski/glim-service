@@ -109,9 +109,9 @@ def _mapping(value, where):
 
 
 def _unknown(block, allowed, where):
-    extra = sorted(set(block) - set(allowed))
+    extra = sorted(map(str, set(block) - set(allowed)))   # YAML keys can be ints, dates, ...
     if extra:
-        raise ConfigError(f"unknown {where} key(s): {', '.join(map(str, extra))} "
+        raise ConfigError(f"unknown {where} key(s): {', '.join(extra)} "
                           f"(supported: {', '.join(sorted(allowed))})")
 
 
@@ -223,6 +223,10 @@ def derive_frames(frames):
         out[key] = value
     if out["map"] == out["odom"]:
         raise ConfigError("frames.map and frames.odom must differ (GLIM publishes map -> odom)")
+    for key in ("base", "imu", "lidar"):
+        if out[key] in (out["map"], out["odom"]):
+            raise ConfigError(f"frames.{key} {out[key]!r} would make GLIM publish a transform from "
+                              f"a frame to itself (it publishes map -> odom -> base)")
     out["publish_imu_to_lidar"] = _bool(frames.get("publish_imu_to_lidar", False),
                                         "frames.publish_imu_to_lidar")
     return out
@@ -235,6 +239,8 @@ def derive_glim(glim):
     for module, block in glim.items():
         block = _mapping(block, f"glim.{module}")
         for key in block:
+            if not isinstance(key, str):
+                raise ConfigError(f"glim.{module} key {key!r} must be a string")
             owner = RESERVED.get(module, {}).get(key)
             if owner:
                 raise ConfigError(f"glim.{module}.{key} is derived by this wrapper; set {owner} instead")
@@ -328,7 +334,8 @@ def derive_zenoh(zenoh):
                 for key in sorted(val):
                     leaves(f"{prefix}/{key}" if prefix else str(key), val[key])
             else:
-                pairs.append((prefix, json.dumps(val, sort_keys=True, separators=(",", ":"))))
+                pairs.append((prefix, json.dumps(val, sort_keys=True, separators=(",", ":"),
+                                                 allow_nan=False)))
         leaves("", overrides)
     for path, value in pairs:
         if ";" in path or ";" in value:
@@ -356,25 +363,47 @@ def load(path):
     return cfg
 
 
-def identity(cfg):
-    _unknown(cfg, TOP_KEYS, "top-level")
-    service = _ident("service", str(cfg.get("service") or "glim"))
+def _default(cfg, key, default):
+    """`is None`, not `or`: YAML reads `name: no` as False, which must fail, not become a default."""
+    value = cfg.get(key)
+    return default if value is None else value
+
+
+def identity(cfg, strict=True):
+    if strict:
+        _unknown(cfg, TOP_KEYS, "top-level")
+    service = _ident("service", _default(cfg, "service", "glim"))
     if service != "glim":
         raise ConfigError(f"service {service!r}: this launcher only runs `glim` configs")
-    name = _ident("name", cfg.get("name") or "glim")
+    name = _ident("name", _default(cfg, "name", "glim"))
     ros = _mapping(cfg.get("ros"), "ros")
-    _unknown(ros, ("namespace", "use_sim_time"), "ros")
-    namespace = _ident("ros.namespace", ros.get("namespace") or name)
-    initial_state = cfg.get("initial_state") or "active"
+    if strict:
+        _unknown(ros, ("namespace", "use_sim_time"), "ros")
+    namespace = _ident("ros.namespace", _default(ros, "namespace", name))
+    initial_state = _default(cfg, "initial_state", "active")
     if initial_state not in ("active", "standby"):
         raise ConfigError(f"initial_state {initial_state!r} must be 'active' or 'standby'")
     return service, name, namespace, initial_state
 
 
-def render_env(cfg, warn=True):
-    service, name, namespace, initial_state = identity(cfg)
-    zenoh_pairs, zenoh_warns = derive_zenoh(cfg.get("zenoh"))
-    timeout = derive_map(cfg.get("map"))["save_timeout_s"]
+def render_env(cfg, warn=True, lenient=False):
+    """Identity env. `lenient` is for verbs that inspect or tear down a running instance: a later
+    edit that broke an unrelated block must never stop `down`, `ps`, `logs` or `state` from
+    reaching it — only identity (which keys the compose project) is still enforced."""
+    if lenient:
+        service, name, namespace, initial_state = identity(cfg, strict=False)
+        try:
+            zenoh_pairs, zenoh_warns = derive_zenoh(cfg.get("zenoh"))
+        except ConfigError:
+            zenoh_pairs, zenoh_warns = "", []
+        try:
+            timeout = derive_map(cfg.get("map"))["save_timeout_s"]
+        except ConfigError:
+            timeout = float(SAVE_TIMEOUT_DEFAULT_S)
+    else:
+        service, name, namespace, initial_state = identity(cfg)
+        zenoh_pairs, zenoh_warns = derive_zenoh(cfg.get("zenoh"))
+        timeout = derive_map(cfg.get("map"))["save_timeout_s"]
     # warn in ONE mode only: a `glim-up` run renders both, and each warning should surface once
     for message in zenoh_warns if warn else ():
         sys.stderr.write("render_config: " + message + "\n")
@@ -392,7 +421,7 @@ def render_instance(cfg, sim_time_env=None):
         use_sim_time = parse_sim_time(sim_time_env)  # explicit config wins both ways
     else:
         _bool(use_sim_time, "ros.use_sim_time")
-    pipeline = cfg.get("pipeline", "lightweight")
+    pipeline = _default(cfg, "pipeline", "lightweight")
     if pipeline not in PIPELINES:
         raise ConfigError(f"pipeline {pipeline!r} must be one of {', '.join(PIPELINES)}"
                           " (this image is CPU-only)")
@@ -431,6 +460,9 @@ def render_instance(cfg, sim_time_env=None):
 def main(argv=None):
     args = list(sys.argv[1:] if argv is None else argv)
     mode = args.pop(0) if args and args[0] in ("--env0", "--instance") else None
+    lenient = mode == "--env0" and args[:1] == ["--lenient"]
+    if lenient:
+        args = args[1:]
     sim_time = None
     if mode == "--instance" and args[:1] == ["--sim-time"]:
         if len(args) < 2:
@@ -439,23 +471,28 @@ def main(argv=None):
         sim_time = args[1]
         args = args[2:]
     if mode is None or len(args) != 1:
-        sys.stderr.write("usage: render_config.py --env0 <config.yaml>\n"
+        sys.stderr.write("usage: render_config.py --env0 [--lenient] <config.yaml>\n"
                          "       render_config.py --instance [--sim-time V] <config.yaml>\n")
         return 2
     try:
         cfg = load(args[0])
         if mode == "--env0":
             out = sys.stdout.buffer
-            for key, value in render_env(cfg):
+            for key, value in render_env(cfg, lenient=lenient):
                 out.write(key.encode() + b"\0" + value.encode() + b"\0")
             out.flush()
         else:
             # render_env's checks too, so `config`/`up` fail on everything the launcher reads
             render_env(cfg, warn=False)
-            json.dump(render_instance(cfg, sim_time), sys.stdout, sort_keys=True, indent=2)
-            sys.stdout.write("\n")
+            # allow_nan=False: GLIM's JSON parser rejects NaN/Infinity, so fail here, not there
+            text = json.dumps(render_instance(cfg, sim_time), sort_keys=True, indent=2,
+                              allow_nan=False)
+            sys.stdout.write(text + "\n")
     except ConfigError as error:
         sys.stderr.write(f"render_config: {args[0]}: {error}\n")
+        return 2
+    except (TypeError, ValueError) as error:   # YAML values JSON cannot carry (dates, NaN, ...)
+        sys.stderr.write(f"render_config: {args[0]}: unsupported value: {error}\n")
         return 2
     except (OSError, yaml.YAMLError) as error:
         sys.stderr.write(f"render_config: {error}\n")

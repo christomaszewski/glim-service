@@ -81,6 +81,7 @@ def serve():
         initial=initial, glim_binary=GLIM_BINARY,
         provenance={**load_provenance(UPSTREAM_SOURCES), **service_identity()},
         stop_event=stop_event)
+    controller.recover_interrupted()
     identity = {"vehicle_id": os.environ.get("VEHICLE_ID", ""), "instance": instance["instance"],
                 "service": instance["service"]}
 

@@ -51,6 +51,7 @@ docker/compose/compose.deploy.yaml   the per-instance compose; compose.datadir.y
 docker/entrypoints/              ros-entrypoint.sh (ROS env, zenoh overrides), glim-statectl (state client)
 supervisor/glim_supervisor/      the in-container supervisor (controller, config, health, ROS, socket)
 tests/, tools/test_build_contract.py   regression suites (host, and inside the image in CI)
+tests/e2e/                       end-to-end smoke: real GLIM + synthetic sensors via glim-up
 ```
 
 ## Quick start (standalone, no rig)
@@ -172,14 +173,24 @@ rig standby slam / rig activate slam / rig up --standby   # the same, fleet-wide
 
 - **active** = a session is running and GLIM's node is on the ROS graph; **standby** = no session,
   last map saved. Each activation starts a new session (a fresh map); there is no pause.
-- The target persists across container restarts (`restart: unless-stopped`); `up` re-asserts the
-  requested target over the control socket and waits for it (budget `GLIM_SETTLE_TIMEOUT`, default
-  stop grace + 60 s). The startup target reaches a new container through a mounted file, never the
-  Compose environment, so `rig up` after `rig activate` leaves the running session alone; a changed
-  *config* does recreate the container, which saves the running map first.
+- The target is persisted in the container (fsynced) and resumed after a restart
+  (`restart: unless-stopped`, reboot). A container that `up` creates starts toward
+  `RIG_TARGET_STATE` > `initial_state` > active, delivered through a mounted file (never the Compose
+  environment, so a different target never recreates a running container). A container that is
+  already running keeps **its** target: a bare `rig up` — a boot unit, another stack being added —
+  never reverses a `rig activate` or a mission's lifecycle call; only an explicit
+  `rig up --standby/--active` re-asserts. `up` then waits for a settled state (budget
+  `GLIM_SETTLE_TIMEOUT`, default stop grace + 60 s). A changed *config* recreates the container,
+  which saves the running map first.
+- Under `rig replay` (`RIG_REPLAY_SOURCE`), `up` activates the instance even if its config parks
+  it, so the replay run gets a map.
 - **Mission software** can drive the same states with standard ROS lifecycle calls — the
-  supervisor's lifecycle node mirrors the target (`inactive` ⇔ standby, `active` ⇔ active), and
-  both paths go through one controller, so `rig status` always agrees with ROS:
+  supervisor's lifecycle node mirrors the target (`active` ⇔ active; standby is `unconfigured` or
+  `inactive`, so a standard lifecycle manager's configure → activate bringup and its cleanup work
+  unchanged), and both paths go through one controller, so `rig status` always agrees with ROS.
+  A transition's result reports what actually happened: a failed activate leaves the node
+  inactive (and GLIM stopped); a deactivate whose save failed still succeeds, because GLIM did stop
+  (the lost map is reported on `/diagnostics` and in `session.json`):
 
   ```bash
   ros2 lifecycle set /slam/glim_supervisor activate     # start mapping
@@ -188,25 +199,30 @@ rig standby slam / rig activate slam / rig up --standby   # the same, fleet-wide
 
   A lifecycle `shutdown` parks GLIM and retires the lifecycle interface until the container restarts.
 - `down` (and `docker stop`) saves the running session's map first. A save that misses its budget
-  (`map.save_timeout_s`) or fails makes `standby` exit non-zero, the container exit non-zero on
-  stop (so `down` reports it), and `/diagnostics` WARN until the next clean save.
+  (`map.save_timeout_s`) or fails — or a GLIM crash just before a standby — makes `standby` exit
+  non-zero, the container exit non-zero on stop (so `down` reports it), and `/diagnostics` WARN
+  until the next clean save.
+- Verbs that inspect or tear down (`down`, `status`, `logs`, `state`, `standby`, `activate`) only
+  need the config's identity, so an edit that broke another block never strands a running instance.
 - Health is readiness, not data flow: a parked standby is healthy; the container turns unhealthy
-  only when GLIM keeps failing (three consecutive failed sessions).
+  only while the target is active and GLIM keeps failing (three consecutive failed sessions).
 
 ## Map sessions
 
 ```
 <data_dir>/current/maps/<name>/<UTC start>/     # flat <data_dir>/maps/… without an open run;
   session.json     instance, pipeline, inputs,  #   the glim_<name>_maps volume without a data dir
-                   start/end, outcome (saved | save_timeout | failed | exited | failed_to_start),
-                   map_saved, config warnings, upstream SHAs, wrapper build identity
+                   start/end, outcome, map_saved, config warnings, upstream SHAs, build identity
   config/          the exact GLIM config the session ran with
   logs/            GLIM's per-module logs
   dump/            GLIM's map: factor graph, submaps, odom_*/traj_* trajectories (TUM format)
 ```
 
-A session pins the run that was open when it **started** (rig's writer rule), and files are
-chowned to the data dir's owner. Open `dump/` with GLIM's `offline_viewer` on a desktop (it is not
+Outcomes: `saved`; `not_started` (stopped before GLIM initialized — nothing to save); `exited`
+(GLIM ended on its own); `save_timeout` / `failed` (the dump may be incomplete); `interrupted` (the
+supervisor itself was killed mid-session; closed out at its next start); `failed_to_start`.
+`map_saved` is true only for a clean save of a non-empty dump. A session pins the run that was open
+when it **started** (rig's writer rule), and files are chowned to the data dir's owner. Open `dump/` with GLIM's `offline_viewer` on a desktop (it is not
 built into this headless image) to inspect, add manual loop closures, or export a PLY point cloud.
 
 ## ROS interface
@@ -234,14 +250,18 @@ The supervisor publishes `/diagnostics` every `health.interval_s`, following the
 
 | Component | Values | Levels |
 |---|---|---|
-| `<name>: service` | `op.state`, `op.target`, `glim.session`, `glim.restarts`, `uptime_s` | ERROR while GLIM keeps failing; WARN on config warnings |
-| `<name>: odometry` | `fps.delivered`, `frame_age_s`, `fps.expected` | WARN when stalled while active |
-| `<name>: imu` | `fps.delivered`, `frame_age_s` | WARN when the IMU input stalls while active |
+| `<name>: service` | `op.state`, `op.target`, `glim.session`, `glim.restarts`, `glim.error`, `uptime_s` | ERROR while GLIM keeps failing; WARN on config warnings or an incomplete map save |
+| `<name>: odometry` | `fps.delivered`, `frame_age_s`, `fps.expected` | WARN when stalled, or GLIM is not running, while active |
+| `<name>: imu` | `fps.delivered`, `frame_age_s` | WARN when the IMU input stalls while active (measured with GLIM's own QoS, so it sees what GLIM can) |
 | `<name>: points` | `publishers` | WARN with no publisher (graph only: no second subscriber to the cloud) |
 | `<name>: storage` | `disk.free_gb`, `disk.free_pct` | producer `limits` only |
 
-Stream checks are demanded only while active (standby reports them `paused`), with a short grace
-after each session start. Thresholds are producer configuration (`health.limits`), never built in.
+Streams are demanded whenever the target is active — including while GLIM restarts — and reported
+`paused` in standby. The delivered rate decays when a stream stops while `frame_age_s` keeps
+growing; a rate is omitted (never a fabricated zero) until there is enough data to measure, and
+limits are not applied during a short grace after each session start. `health.error` is reserved
+for failing to observe (storage unreadable, graph query failed). Thresholds are producer
+configuration (`health.limits`), never built in.
 
 ## Replay
 
@@ -259,15 +279,25 @@ pipeline sustains in real time.
   `GLIM_BUILD_JOBS` (GTSAM needs about 2 GB of RAM per compile job). Build arm64 natively.
 - GTSAM is built from source on purpose: GLIM saves maps through GTSAM's Boost serialization, which
   the ROS-packaged `gtsam` disables (and builds with TBB, against GLIM's recommendation).
-- The image's build gates: every shipped library's dependencies are derived from the binaries
-  (`ldd` → `dpkg -S`), every library must load fully bound in the runtime stage, and the ros-*
-  versions must match what GLIM compiled against.
-- CI (`.github/workflows/ci.yml`): image build + in-image tests on amd64 and arm64, `rig certify
-  --require-build-check`, host regressions, build-contract tests, shellcheck.
+- The image's build gates: runtime packages are derived from the binaries (`ldd` → `dpkg -S`;
+  an unresolvable library fails the build) plus the supervisor's `package.xml` (resolved by rosdep
+  in the build stage, so the runtime stage is plain apt and touches nothing of the parent's); every
+  ELF file must resolve and every library load fully bound in the runtime stage; and the ros-*
+  versions must match what GLIM compiled against. Only `glim_rosnode` ships (not `glim_rosbag`,
+  which would pull rosbag2 in for nothing); `created` is the wrapper commit's time.
+- CI (`.github/workflows/ci.yml`), on amd64 and arm64: the image build and its gates; the full
+  test suite inside the image (including the supervisor process, its ROS lifecycle node and
+  `/diagnostics` against a fake GLIM); a check that the image ships exactly the tested supervisor;
+  and an end-to-end smoke test (`tests/e2e/smoke.sh`) — the real GLIM driven through `glim-up` on
+  synthetic lidar + IMU under both Fast DDS and Zenoh, asserting odometry, health, map saves and
+  session records. Plus `rig certify --require-build-check`, host regressions, build-contract
+  tests and shellcheck.
 
 ```bash
-python3 -m unittest discover -s tests -v                                 # host (config tests skip)
-docker run --rm -v "$PWD:/workspace:ro" -w /workspace glim:dev python3 -m unittest discover -s tests
+python3 -m unittest discover -s tests -v          # host: ROS and upstream-config tests skip
+docker run --rm --no-healthcheck --network none -v "$PWD:/workspace:ro" -w /workspace glim:dev \
+  python3 -m unittest discover -s tests             # everything, inside the image
+GLIM_IMAGE=glim:dev tests/e2e/smoke.sh             # real GLIM end to end (RMW_IMPLEMENTATION=rmw_zenoh_cpp too)
 ../rig/rig certify --repo . --config autonomy/glim.example.yaml
 ```
 

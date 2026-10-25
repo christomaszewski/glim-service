@@ -67,6 +67,17 @@ class ControlSocketTests(unittest.TestCase):
         self.assertEqual(json.loads(stdout.getvalue()),
                          {"state": "standby", "target": "standby", "detail": "fake"})
 
+    def test_state_output_matches_the_launchers_patterns(self):
+        # glim-up's settle loop matches these literal fragments in the probe's stdout.
+        stdout = io.StringIO()
+        self.controller.target = "active"
+        with mock.patch.object(control, "SOCKET", self.path), mock.patch("sys.stdout", stdout):
+            cli.main(["state"])
+        launcher = (ROOT / "glim-up").read_text()
+        self.assertIn('\\"state\\": \\"$TARGET_STATE\\"', launcher)
+        self.assertIn('"state": "active"', stdout.getvalue())
+        self.assertIn('"target": "active"', stdout.getvalue())
+
     def test_cli_health_exit_code(self):
         with mock.patch.object(control, "SOCKET", self.path):
             self.assertEqual(cli.main(["health"]), 0)

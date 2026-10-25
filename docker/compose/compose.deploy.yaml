@@ -41,12 +41,22 @@ services:
       # where map sessions are written; compose.datadir.yaml points it at the vehicle data dir
       GLIM_MAP_ROOT: /var/lib/glim/store
     volumes:
-      # the rendered instance file, read-only (a single-file mount; not nested in any :ro dir)
-      - ${GLIM_INSTANCE_HOST}:/etc/glim/instance.json:ro
-      # the startup target (RIG_TARGET_STATE > initial_state > active), resolved by the launcher.
-      # A file at a fixed path, so a changed target never recreates a running container; the
-      # supervisor reads it only when the container has no persisted target of its own.
-      - ${GLIM_TARGET_HOST}:/etc/glim/target:ro
+      # The rendered instance file and the startup target (RIG_TARGET_STATE > initial_state >
+      # active), read-only single-file mounts. The target file sits at a fixed path, so a changed
+      # target never recreates a running container; the supervisor reads it only when the container
+      # has no persisted target of its own. create_host_path: false — if a source vanished (a
+      # vendor refresh, `git clean`), fail the start instead of letting Docker create a DIRECTORY in
+      # its place, which would break the container until someone removed it by hand.
+      - type: bind
+        source: ${GLIM_INSTANCE_HOST}
+        target: /etc/glim/instance.json
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${GLIM_TARGET_HOST}
+        target: /etc/glim/target
+        read_only: true
+        bind: {create_host_path: false}
       # fallback map store: maps/<name>/<session>/ (config, logs, GLIM dump) when no data dir is
       # known. Always mounted, so the declared external volume is part of every render. `maps` is a
       # static local alias for the per-instance external volume below (compose does NOT

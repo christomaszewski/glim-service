@@ -23,7 +23,8 @@ from rclpy.clock import Clock, ClockType
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.lifecycle import LifecycleNodeMixin, TransitionCallbackReturn
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, qos_profile_sensor_data
+from rclpy.qos import (DurabilityPolicy, HistoryPolicy, QoSPresetProfiles, QoSProfile,
+                       ReliabilityPolicy)
 from rclpy.signals import SignalHandlerOptions
 
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
@@ -37,6 +38,37 @@ LOG = logging.getLogger("glim-supervisor")
 
 def _resolve(namespace, topic):
     return topic if topic.startswith("/") else f"{namespace.rstrip('/')}/{topic}"
+
+
+def glim_qos(spec):
+    """The QoS GLIM's own subscription uses for a rendered `*_qos` block (glim_ros2 ros_qos.cpp:
+    a profile, default sensor_data, with any of depth/reliability/durability/history applied).
+    The monitor must match it, or it could report a stream GLIM itself cannot receive."""
+    spec = spec or {}
+    qos = QoSPresetProfiles.get_from_short_key(spec.get("profile", "sensor_data"))
+    qos = QoSProfile(history=qos.history, depth=qos.depth, reliability=qos.reliability,
+                     durability=qos.durability)
+    if "depth" in spec:
+        qos.depth = spec["depth"]
+    for key, policy in (("reliability", ReliabilityPolicy), ("durability", DurabilityPolicy),
+                        ("history", HistoryPolicy)):
+        if key in spec:
+            setattr(qos, key, policy.get_from_short_key(spec[key]))
+    return qos
+
+
+class Throttled:
+    """Log a recurring failure once per interval, not once per heartbeat."""
+
+    def __init__(self, interval_s=30.0):
+        self.interval_s = interval_s
+        self.last = {}
+
+    def error(self, key, message, *args):
+        now = time.monotonic()
+        if now - self.last.get(key, -self.interval_s) >= self.interval_s:
+            self.last[key] = now
+            LOG.error(message, *args)
 
 
 class SupervisorNode(LifecycleNodeMixin, Node):
@@ -74,7 +106,9 @@ class SupervisorNode(LifecycleNodeMixin, Node):
                                  callback_group=monitors)
         self.create_subscription(Imu, self.topics["imu"],
                                  lambda _: self.imu.record(time.monotonic()),
-                                 qos_profile_sensor_data, callback_group=imu_group)
+                                 glim_qos(instance["glim"]["glim_ros"].get("imu_qos")),
+                                 callback_group=imu_group)
+        self.throttled = Throttled()
         self.diagnostics = self.create_publisher(
             DiagnosticArray, "/diagnostics",
             QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE))
@@ -85,14 +119,22 @@ class SupervisorNode(LifecycleNodeMixin, Node):
         return threading.get_ident() != self.sync_thread
 
     def _drive(self, target):
+        """Run a mission-requested transition; report what the controller actually did.
+
+        The result follows the controller's resulting state, not whether transition() raised: a
+        standby whose map save failed has still stopped GLIM (inactive is the truth), while a
+        request that could not get the transition lock changed nothing. A failed activate reverts
+        the target, so FAILURE leaves the node inactive with nothing left to re-activate it.
+        """
         try:
-            # A lifecycle activate that reports FAILURE must leave the node inactive, so it may
-            # not leave an `active` target behind for sync() to re-activate.
             self.controller.transition(target, revert_on_failure=(target == "active"))
-            return TransitionCallbackReturn.SUCCESS
         except Exception as error:
-            LOG.error("lifecycle -> %s failed: %s", target, error)
-            return TransitionCallbackReturn.FAILURE
+            LOG.error("lifecycle -> %s: %s", target, error)
+        if target == "active":
+            reached = self.controller.target == "active"
+        else:
+            reached = self.controller.target == "standby" and self.controller.session is None
+        return TransitionCallbackReturn.SUCCESS if reached else TransitionCallbackReturn.FAILURE
 
     def on_configure(self, state):
         return TransitionCallbackReturn.SUCCESS
@@ -107,8 +149,9 @@ class SupervisorNode(LifecycleNodeMixin, Node):
         return TransitionCallbackReturn.SUCCESS
 
     def on_shutdown(self, state):
+        # Finalizing retires this interface; refuse while GLIM would keep mapping unsupervised by it.
         if self._external() and self.controller.target == "active":
-            self._drive("standby")
+            return self._drive("standby")
         return TransitionCallbackReturn.SUCCESS
 
     def on_error(self, state):
@@ -121,14 +164,18 @@ class SupervisorNode(LifecycleNodeMixin, Node):
             return None
 
     def sync(self):
-        """Carry the controller's target into the lifecycle state (never the other way)."""
+        """Carry the controller's target into the lifecycle state (never the other way).
+
+        Only `active` is forced. Standby is either `unconfigured` or `inactive`, so a standard
+        lifecycle manager's bringup (configure, then activate) and its cleanup both work as usual.
+        """
         label = self.lifecycle_label()
         if label in (None, "finalized") or self.controller.changing.is_set():
             return
         want = self.controller.target
         self.sync_thread = threading.get_ident()
         try:
-            if label == "unconfigured":
+            if want == "active" and label == "unconfigured":
                 self.trigger_configure()
                 label = self.lifecycle_label()
             if want == "active" and label == "inactive":
@@ -148,6 +195,12 @@ class SupervisorNode(LifecycleNodeMixin, Node):
             return None
 
     def publish_health(self):
+        try:
+            self._publish_health()
+        except Exception as error:   # one bad heartbeat must not end health reporting
+            self.throttled.error("health", "health publication failed: %s", error)
+
+    def _publish_health(self):
         snapshot = self.controller.snapshot()
         if snapshot["session"] != self.session_seen:   # rates are per session
             self.session_seen = snapshot["session"]
@@ -189,7 +242,19 @@ class RosInterface:
         self.node = SupervisorNode(controller, instance, identity, map_root)
         self.executor = MultiThreadedExecutor(num_threads=4)
         self.executor.add_node(self.node)
-        self.thread = threading.Thread(target=self.executor.spin, name="ros", daemon=True)
+        self.stopping = threading.Event()
+        self.thread = threading.Thread(target=self._spin, name="ros", daemon=True)
+
+    def _spin(self):
+        # executor.spin() re-raises the first callback exception and returns for good — the
+        # lifecycle services and /diagnostics would silently die. Spin in steps and keep going.
+        while not self.stopping.is_set():
+            try:
+                self.executor.spin_once(timeout_sec=0.5)
+            except Exception as error:
+                if self.stopping.is_set():
+                    break
+                self.node.throttled.error("spin", "ROS callback failed: %s", error)
 
     def start(self):
         self.thread.start()
@@ -200,10 +265,20 @@ class RosInterface:
     def sync(self):
         self.node.sync()
 
-    def close(self):
-        try:
-            self.executor.shutdown(timeout_sec=2)
-            self.node.destroy_node()
-        finally:
-            if rclpy.ok():
-                rclpy.shutdown()
+    def close(self, timeout_s=5.0):
+        """Bounded teardown: it runs inside the container's stop grace period, after the map save,
+        and a callback stuck on a hung volume must not turn a clean stop into a SIGKILL."""
+        def teardown():
+            try:
+                self.executor.shutdown(timeout_sec=2, wait_for_threads=False)
+                self.thread.join(timeout=2)
+                self.node.destroy_node()
+            finally:
+                if rclpy.ok():
+                    rclpy.shutdown()
+        self.stopping.set()
+        worker = threading.Thread(target=teardown, name="ros-close", daemon=True)
+        worker.start()
+        worker.join(timeout_s)
+        if worker.is_alive():
+            LOG.warning("ROS teardown still blocked after %.0fs; exiting without it", timeout_s)

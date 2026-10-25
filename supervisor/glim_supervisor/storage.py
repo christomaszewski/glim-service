@@ -75,6 +75,24 @@ def adopt_ownership(path, reference, recursive=True):
                 return
 
 
+def write_durable(path, text):
+    """Atomic AND durable: fsync the file before the rename and the directory after it, so power
+    loss leaves either the old content or the new — never an empty file."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    with open(temporary, "w") as stream:
+        stream.write(text)
+        stream.flush()
+        os.fsync(stream.fileno())
+    temporary.replace(path)
+    directory = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
 def write_json(path, document):
     """Atomic JSON write (a reader never sees a half-written session record)."""
     path = Path(path)

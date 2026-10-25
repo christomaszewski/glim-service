@@ -84,9 +84,21 @@ jobs:
             BUILD_JOBS=4
       - name: Test suite inside the image
         run: |
-          docker run --rm --network none -e PYTHONDONTWRITEBYTECODE=1 \
+          docker run --rm --no-healthcheck --network none -e PYTHONDONTWRITEBYTECODE=1 \
             -v "$PWD:/workspace:ro" -w /workspace glim:ci \
             python3 -m unittest discover -s tests -v
+      # The suite imports the checkout's supervisor; prove the image ships exactly that code.
+      - name: Image ships the tested supervisor
+        run: |
+          docker run --rm --no-healthcheck -v "$PWD:/workspace:ro" glim:ci \
+            diff -r -x __pycache__ /workspace/supervisor/glim_supervisor /opt/glim_supervisor/glim_supervisor
+      # The real GLIM, through the real launcher, on synthetic sensors: maps, health, standby
+      # saves a loadable dump, a new session on activate, a clean down. Both fleet RMWs.
+      - run: python3 -m pip install --user pyyaml
+      - name: End-to-end smoke (Fast DDS)
+        run: GLIM_IMAGE=glim:ci RMW_IMPLEMENTATION=rmw_fastrtps_cpp tests/e2e/smoke.sh
+      - name: End-to-end smoke (Zenoh)
+        run: GLIM_IMAGE=glim:ci RMW_IMPLEMENTATION=rmw_zenoh_cpp tests/e2e/smoke.sh
 
   # ---------------------------------------------------------------------------
   # rig launcher contract, executable (see rigging.yaml). `rig certify` runs
@@ -132,5 +144,5 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: shellcheck launcher + build scripts + entrypoints
-        run: shellcheck -x glim-up tools/build_image.sh tools/rig-build.sh docker/entrypoints/ros-entrypoint.sh docker/entrypoints/glim-statectl
+      - name: shellcheck launcher + build scripts + entrypoints + e2e
+        run: shellcheck -x glim-up tools/build_image.sh tools/rig-build.sh docker/entrypoints/ros-entrypoint.sh docker/entrypoints/glim-statectl tests/e2e/smoke.sh

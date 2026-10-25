@@ -111,22 +111,39 @@ RUN --mount=type=cache,id=glim-ccache-${ROS_DISTRO}-${TARGETARCH},target=/root/.
         -DBUILD_WITH_CUDA=OFF -DBUILD_WITH_VIEWER=OFF -DBUILD_WITH_MARCH_NATIVE=OFF \
         -DBUILD_WITH_OPENCV=OFF -DBUILD_WITH_CV_BRIDGE=OFF -DBUILD_TESTING=OFF \
  && ccache --show-stats \
- && rm -rf /opt/glim/include /opt/glim/lib/cmake /opt/glim/share/*/cmake
-# Record what the runtime needs, from the binaries themselves: every shared library the installed
-# tree resolves outside /opt/glim, mapped to the Debian package that owns it. Plus the ros-* versions
-# GLIM compiled against, which the runtime gate compares (independently cached apt layers can skew).
+ && rm -rf /opt/glim/include /opt/glim/lib/cmake /opt/glim/share/*/cmake \
+ && rm -f /opt/glim/lib/glim_ros/glim_rosbag /opt/glim/lib/glim_ros/validator_node
+# (glim_rosbag and validator_node are not used by this service; shipping them would pull rosbag2
+# into the runtime for nothing. Recorded runs are processed through `rig replay`.)
+#
+# Record what the runtime needs. GLIM's side comes from the binaries themselves: every shared
+# library the installed tree resolves outside /opt/glim, mapped to the Debian package owning it —
+# and an unresolvable one fails the build here rather than on the vehicle. The supervisor's side
+# (rclpy, message types, both RMWs) comes from its package.xml via rosdep, resolved HERE so the
+# runtime stage needs no rosdep at all. Plus the ros-* versions GLIM compiled against, which the
+# runtime gate compares (independently cached apt layers can skew).
+COPY docker/runtime_deps/package.xml /workspace/runtime_deps/package.xml
 RUN source "/opt/ros/${ROS_DISTRO}/setup.bash" && source /opt/glim/setup.bash \
  && export LD_LIBRARY_PATH="/opt/glim/lib:${LD_LIBRARY_PATH:-}" \
  && { find /opt/glim -type f \( -name '*.so*' -o -perm -111 \) -print0 \
-        | xargs -0 -r ldd 2>/dev/null || true; } \
-      | awk '$2 == "=>" && $3 ~ /^\// {print $3}' | sort -u \
+        | xargs -0 -r ldd 2>/dev/null || true; } > /tmp/ldd.txt \
+ && if grep -q "not found" /tmp/ldd.txt; then \
+      echo "ERROR: unresolved shared libraries in the GLIM install:"; grep "not found" /tmp/ldd.txt; exit 1; \
+    fi \
+ && awk '$2 == "=>" && $3 ~ /^\// {print $3}' /tmp/ldd.txt | sort -u \
       | while read -r lib; do \
           case "$lib" in /opt/glim/*) continue ;; esac; \
           real="$(readlink -f "$lib")"; \
           dpkg -S "$real" 2>/dev/null || dpkg -S "$lib" 2>/dev/null \
             || { echo "no package owns $lib ($real)" >&2; exit 1; }; \
-        done | cut -d: -f1 | sort -u > /opt/glim/share/runtime-packages.txt \
+        done | cut -d: -f1 > /tmp/runtime-packages.txt \
+ && python3 -c 'import sys, xml.etree.ElementTree as t; print(" ".join(e.text for e in t.parse(sys.argv[1]).iter("exec_depend")))' \
+      /workspace/runtime_deps/package.xml > /tmp/wrapper-keys.txt \
+ && rosdep resolve --rosdistro "${ROS_DISTRO}" $(cat /tmp/wrapper-keys.txt) | grep -v '^#' \
+      >> /tmp/runtime-packages.txt \
+ && sort -u /tmp/runtime-packages.txt > /opt/glim/share/runtime-packages.txt \
  && test -s /opt/glim/share/runtime-packages.txt \
+ && rm -f /tmp/ldd.txt /tmp/runtime-packages.txt /tmp/wrapper-keys.txt \
  && cp /workspace/src/upstream-sources.json /opt/glim/share/upstream-sources.json \
  && dpkg-query -W -f='${Package}\t${Version}\t${db:Status-Status}\n' 'ros-*' \
       | awk '$3 == "installed" {print $1 "\t" $2}' > /opt/glim/share/build-ros-packages.tsv
@@ -134,23 +151,12 @@ RUN source "/opt/ros/${ROS_DISTRO}/setup.bash" && source /opt/glim/setup.bash \
 # ---- runtime --------------------------------------------------------------------------------------
 FROM base AS runtime
 ARG ROS_DISTRO
-ARG GLIM_SERVICE_REF=unknown
-ARG GLIM_SERVICE_REV=unknown
+# Plain apt from the resolved list: no rosdep (and nothing to purge, so nothing of the parent's can
+# be auto-removed). Under the fleet-ros parent most packages are present and held at its versions.
 COPY --from=build /opt/glim/share/runtime-packages.txt /tmp/runtime-packages.txt
-COPY docker/runtime_deps/package.xml /tmp/deps/glim_service_runtime_deps/package.xml
-# GLIM's libraries (from the binaries) + the supervisor's ROS deps and both RMWs (via rosdep). Under
-# the fleet-ros parent most are already present and held at the parent's versions. rosdep is removed
-# again afterwards, with the sudo it pulls in (a container has no use for it; its maintainer script
-# refuses removal without SUDO_FORCE_REMOVE).
 RUN apt-get update \
  && xargs -r -a /tmp/runtime-packages.txt apt-get install -y --no-install-recommends \
- && apt-get install -y --no-install-recommends python3-rosdep \
- && (rosdep init 2>/dev/null || true) \
- && rosdep update --rosdistro "${ROS_DISTRO}" \
- && rosdep install --from-paths /tmp/deps --ignore-src -y --rosdistro "${ROS_DISTRO}" \
-      --dependency-types=exec \
- && SUDO_FORCE_REMOVE=yes apt-get purge -y --auto-remove python3-rosdep \
- && rm -rf /tmp/deps /tmp/runtime-packages.txt /var/lib/apt/lists/* /root/.ros
+ && rm -rf /tmp/runtime-packages.txt /var/lib/apt/lists/*
 COPY --from=build /opt/glim /opt/glim
 RUN echo /opt/glim/lib > /etc/ld.so.conf.d/glim.conf && ldconfig
 # Gate: the shipped tree must load against exactly this stage (see docker/check_runtime.py).
@@ -168,6 +174,11 @@ COPY docker/entrypoints/glim-statectl /usr/local/bin/glim-statectl
 RUN chmod 0755 /usr/local/bin/ros-entrypoint.sh /usr/local/bin/glim-statectl \
  && python3 -m compileall -q /opt/glim_supervisor
 
+# Per-commit identity, declared only here: an ARG becomes part of the cache key of every later
+# RUN, so declaring it earlier would re-run the apt layers on every commit.
+ARG GLIM_SERVICE_REF=unknown
+ARG GLIM_SERVICE_REV=unknown
+ARG GLIM_SERVICE_CREATED=""
 ENV LANG=C.UTF-8 LC_ALL=C.UTF-8 \
     PYTHONPATH=/opt/glim_supervisor \
     PYTHONUNBUFFERED=1 \
@@ -175,12 +186,16 @@ ENV LANG=C.UTF-8 LC_ALL=C.UTF-8 \
     GLIM_DEFAULTS_DIR=/opt/glim/share/glim/config \
     GLIM_SERVICE_REF=${GLIM_SERVICE_REF} \
     GLIM_SERVICE_REV=${GLIM_SERVICE_REV}
+# `created` is the wrapper commit's time (reproducible), replacing the parent's inherited value;
+# io.rig.rosbag2.replay is fleet-ros's player-capability claim, which this image does not make.
 LABEL org.opencontainers.image.title="glim" \
       org.opencontainers.image.description="GLIM lidar-inertial SLAM as a rig autonomy service" \
       org.opencontainers.image.source="https://github.com/christomaszewski/glim-service" \
       org.opencontainers.image.version="${GLIM_SERVICE_REF}" \
       org.opencontainers.image.revision="${GLIM_SERVICE_REV}" \
-      org.opencontainers.image.licenses="Apache-2.0 AND MIT AND BSD-3-Clause"
+      org.opencontainers.image.created="${GLIM_SERVICE_CREATED}" \
+      org.opencontainers.image.licenses="Apache-2.0 AND MIT AND BSD-3-Clause" \
+      io.rig.rosbag2.replay="0"
 # Readiness, not data flow: healthy unless GLIM keeps failing (a parked standby is healthy).
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 CMD ["glim-statectl", "health"]
 ENTRYPOINT ["/usr/local/bin/ros-entrypoint.sh"]

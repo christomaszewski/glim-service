@@ -4,10 +4,11 @@ Clients are the launcher's state verbs (`docker compose exec ... glim-statectl <
 container healthcheck. Only root inside the container can connect (mode 0600).
 """
 import json
+import os
 import socket
 import socketserver
 
-SOCKET = "/run/glim/state.sock"
+SOCKET = os.environ.get("GLIM_STATE_SOCKET", "/run/glim/state.sock")
 COMMANDS = ("state", "standby", "activate", "health")
 
 

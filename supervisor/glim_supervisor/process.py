@@ -47,9 +47,10 @@ class GlimProcess:
     def stop(self, save_timeout_s):
         """SIGINT and wait up to `save_timeout_s` for the map save, then escalate.
 
-        Returns (outcome, exit code): "saved" (clean exit inside the budget), "exited" (it was
-        already gone), "save_timeout" (needed SIGTERM/SIGKILL; the dump may be incomplete) or
-        "failed" (non-zero exit).
+        Returns (outcome, exit code): "saved" (clean exit inside the budget), "not_started"
+        (interrupted before it initialized: nothing to save), "exited" (it was already gone),
+        "save_timeout" (needed SIGTERM/SIGKILL; the dump may be incomplete) or "failed" (non-zero
+        exit).
         """
         if self.popen is None:
             return "exited", None
@@ -77,7 +78,12 @@ class GlimProcess:
         except subprocess.TimeoutExpired:  # unkillable (uninterruptible I/O): report, don't hang
             LOG.error("GLIM (pid %d) survived SIGKILL", self.popen.pid)
             return "save_timeout", None
-        if outcome == "saved" and code != 0:
+        if outcome == "saved" and code == -signal.SIGINT:
+            # Killed by SIGINT's default action: rclcpp had not installed its handler yet, so GLIM
+            # never finished initializing and no map can exist (seen within ~1 s of start under
+            # rmw_zenoh). Not a failed save.
+            outcome = "not_started"
+        elif outcome == "saved" and code != 0:
             outcome = "failed"
         LOG.info("GLIM stopped (%s, exit %s) in %.1fs", outcome, code, self.clock() - started)
         return outcome, code

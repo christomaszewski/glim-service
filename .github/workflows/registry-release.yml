@@ -31,25 +31,38 @@ jobs:
           }
           echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
 
+      # The write token is used for the push alone (below), never stored in registry/.git/config
+      # where the registry's own tooling would run with it.
       - uses: actions/checkout@v4
         with:
           repository: christomaszewski/rig-registry-public
-          token: ${{ secrets.RIG_REGISTRY_TOKEN }}
           path: registry
+          persist-credentials: false
 
       - uses: actions/setup-python@v5
         with: {python-version: "3.12"}
 
+      # Pinned: this job runs with a write token for the public registry.
       - name: install rig (registry validate/index tooling)
-        run: pip install git+https://github.com/christomaszewski/rig
+        run: pip install "git+https://github.com/christomaszewski/rig@v0.2.71"
 
       # GITHUB_SHA on a release event is the tagged commit — exactly the rev consumers should pin.
-      - name: rewrite manifest
+      # Other services release into the same registry: on a non-fast-forward, start over from its
+      # new head (the manifest is rewritten wholesale and index.json regenerated, never merged).
+      - name: publish (rewrite manifest, regenerate index, push; retried on races)
+        working-directory: registry
         env:
           VERSION: ${{ steps.meta.outputs.version }}
+          TOKEN: ${{ secrets.RIG_REGISTRY_TOKEN }}
         run: |
-          mkdir -p registry/services/glim
-          cat > registry/services/glim/manifest.yaml <<EOF
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          remote="https://x-access-token:${TOKEN}@github.com/christomaszewski/rig-registry-public.git"
+          for attempt in 1 2 3 4 5; do
+            git fetch --quiet "$remote" HEAD
+            git reset --quiet --hard FETCH_HEAD
+            mkdir -p services/glim
+            cat > services/glim/manifest.yaml <<EOF
           # AUTO-UPDATED on every glim release by the glim-service repo's registry-release workflow
           # (rewrites this file wholesale + regenerates index.json). Hand-edits will be clobbered
           # by the next release — change the workflow in the glim-service repo instead.
@@ -63,24 +76,19 @@ jobs:
             repo: https://github.com/christomaszewski/glim-service.git
             rev: ${GITHUB_SHA}
           EOF
-
-      - name: regenerate index + validate
-        working-directory: registry
-        run: |
-          ./tools/gen-index
-          ./tools/validate
-
-      - name: commit + push
-        working-directory: registry
-        env:
-          VERSION: ${{ steps.meta.outputs.version }}
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add services/glim/manifest.yaml index.json
-          if git diff --staged --quiet; then
-            echo "registry already current for glim ${VERSION}"
-            exit 0
-          fi
-          git commit -m "glim ${VERSION} (auto: release ${GITHUB_REF_NAME})"
-          git push
+            ./tools/gen-index
+            ./tools/validate
+            git add services/glim/manifest.yaml index.json
+            if git diff --staged --quiet; then
+              echo "registry already current for glim ${VERSION}"
+              exit 0
+            fi
+            git commit --quiet -m "glim ${VERSION} (auto: release ${GITHUB_REF_NAME})"
+            if git push --quiet "$remote" HEAD:main; then
+              exit 0
+            fi
+            echo "push raced another release (attempt ${attempt}); retrying from the new head"
+            sleep $((attempt * 5))
+          done
+          echo "::error::could not publish glim ${VERSION} to the registry after 5 attempts"
+          exit 1

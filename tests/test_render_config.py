@@ -169,6 +169,53 @@ class RenderInstanceTests(unittest.TestCase):
         self.assertEqual(out["glim"]["glim_ros"]["extension_modules"], [])
 
 
+class YamlTypeTests(unittest.TestCase):
+    """YAML is generous with types (`no` is False, `2026-10-23` a date, `.inf` a float)."""
+
+    def assertRejected(self, cfg, fragment):
+        with self.assertRaises(rc.ConfigError) as caught:
+            rc.render_env(cfg, warn=False)
+            rc.render_instance(cfg)
+        self.assertIn(fragment, str(caught.exception))
+
+    def test_falsy_values_are_errors_not_defaults(self):
+        for key, value, fragment in (("name", False, "name False"),
+                                     ("initial_state", False, "initial_state False"),
+                                     ("service", 0, "service 0")):
+            with self.subTest(key=key):
+                cfg = example()
+                cfg[key] = value
+                self.assertRejected(cfg, fragment)
+        cfg = example()
+        cfg["pipeline"] = None   # explicit null = the default
+        self.assertEqual(rc.render_instance(cfg)["pipeline"], "lightweight")
+
+    def test_frames_cannot_publish_a_transform_to_themselves(self):
+        cfg = example()
+        cfg["frames"]["base"] = "odom"
+        self.assertRejected(cfg, "from a frame to itself")
+
+    def test_odd_keys_are_clean_errors(self):
+        cfg = example()
+        cfg[7] = "x"
+        cfg["extra"] = "y"   # mixed key types must not crash the message
+        self.assertRejected(cfg, "unknown top-level key(s): 7, extra")
+        cfg = example()
+        cfg["glim"]["odometry"] = {1: 2}
+        self.assertRejected(cfg, "must be a string")
+
+    def test_lenient_identity_ignores_unrelated_breakage(self):
+        cfg = example()
+        cfg.update(inital_state="standby", zenoh={"shm_pool_mb": -1}, map={"save_timeout_s": "x"})
+        with self.assertRaises(rc.ConfigError):
+            rc.render_env(cfg, warn=False)
+        env = dict(rc.render_env(cfg, warn=False, lenient=True))
+        self.assertEqual((env["NAME"], env["STOP_GRACE_S"], env["ZENOH_OVERRIDE"]), ("slam", "270", ""))
+        cfg["name"] = "Bad Name"   # identity itself is still enforced
+        with self.assertRaises(rc.ConfigError):
+            rc.render_env(cfg, warn=False, lenient=True)
+
+
 class CommandLineTests(unittest.TestCase):
     def run_tool(self, *args, config=None):
         with tempfile.TemporaryDirectory() as tmp:
@@ -205,6 +252,31 @@ class CommandLineTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertEqual(result.stdout, b"")
         self.assertIn(b"slam.yaml: extrinsics.T_lidar_imu is required", result.stderr)
+
+    def test_values_json_cannot_carry_exit_cleanly(self):
+        for value in (float("inf"), float("nan")):
+            with self.subTest(value=value):
+                cfg = example()
+                cfg["glim"]["odometry"] = {"smoother_lag": value}
+                result = self.run_tool("--instance", config=cfg)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn(b"unsupported value", result.stderr)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "slam.yaml"
+            path.write_text(EXAMPLE.read_text() + "\n")
+            path.write_text(path.read_text().replace("  preprocess:\n",
+                                                     "  preprocess:\n    calibrated: 2026-10-23\n"))
+            result = subprocess.run([sys.executable, str(ROOT / "tools/render_config.py"),
+                                     "--instance", str(path)], capture_output=True, timeout=30)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn(b"unsupported value", result.stderr)
+            self.assertNotIn(b"Traceback", result.stderr)
+
+    def test_lenient_flag(self):
+        cfg = example()
+        cfg["inital_state"] = "standby"
+        self.assertEqual(self.run_tool("--env0", config=cfg).returncode, 2)
+        self.assertEqual(self.run_tool("--env0", "--lenient", config=cfg).returncode, 0)
 
     def test_zenoh_warning_surfaces_once_per_launcher_run(self):
         cfg = example()

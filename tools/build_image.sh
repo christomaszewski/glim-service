@@ -32,15 +32,19 @@ IMAGE="${REGISTRY}/glim:${TAG}"
 # context: exact tag, else commit SHA; a dirty tree (tracked or untracked changes) is marked as such
 # and cannot claim a revision. Require this root's own .git so a tarball unpacked inside another
 # checkout cannot borrow that checkout's identity.
+# The commit time becomes the image's `created` label: reproducible, unlike the build time.
 SRC_REF=unknown
 SRC_REV=unknown
+SRC_CREATED=""
 if [ -e "$REPO/.git" ] && REV="$(git -C "$REPO" rev-parse --verify HEAD 2>/dev/null)"; then
   SRC_REV="$REV"
   SRC_REF="$(git -C "$REPO" describe --tags --exact-match "$REV" 2>/dev/null || printf '%s\n' "$REV")"
+  SRC_CREATED="$(git -C "$REPO" log -1 --format=%cI "$REV" 2>/dev/null || true)"
   if ! STATUS="$(git -C "$REPO" status --porcelain --untracked-files=normal 2>/dev/null)" \
       || [ -n "$STATUS" ]; then
     SRC_REF="${SRC_REF}-dirty"
     SRC_REV=unknown
+    SRC_CREATED=""
   fi
 fi
 
@@ -59,4 +63,5 @@ rig_build "$IMAGE" "$@" \
   --build-arg "BASE_IMAGE=${RIG_BASE_IMAGE:-ros:${ROS_DISTRO:-lyrical}-ros-core}" \
   --build-arg "GLIM_SERVICE_REF=${SRC_REF}" \
   --build-arg "GLIM_SERVICE_REV=${SRC_REV}" \
+  --build-arg "GLIM_SERVICE_CREATED=${SRC_CREATED}" \
   -f "$REPO/docker/Dockerfile.runtime" "$REPO"

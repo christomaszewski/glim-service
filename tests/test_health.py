@@ -77,8 +77,9 @@ class HealthTests(unittest.TestCase):
         statuses = self.build(snapshot=snapshot(state="transitioning", failures=3,
                                                 error="GLIM exited unexpectedly (code -11)"))
         self.assertEqual(statuses["service"]["level"], health.ERROR)
-        self.assertEqual(statuses["service"]["values"]["health.error"],
+        self.assertEqual(statuses["service"]["values"]["glim.error"],
                          "GLIM exited unexpectedly (code -11)")
+        self.assertNotIn("health.error", statuses["service"]["values"])   # observation succeeded
         statuses = self.build(snapshot=snapshot(config_warnings=["glim.odometry.x is not in ..."]))
         self.assertEqual(statuses["service"]["level"], health.WARN)
         self.assertIn("glim.odometry.x", statuses["service"]["message"])
@@ -107,12 +108,52 @@ class HealthTests(unittest.TestCase):
 
     def test_rate_tracker(self):
         tracker = health.RateTracker(window_s=5.0)
-        for i in range(11):
+        tracker.record(100.0)
+        self.assertIsNone(tracker.snapshot(100.5)["fps"])        # too early to call it a rate
+        for i in range(1, 11):
             tracker.record(100.0 + i * 0.1)
         snap = tracker.snapshot(101.0)
         self.assertAlmostEqual(snap["fps"], 10.0)
         self.assertEqual(snap["last"], 101.0)
-        self.assertEqual(tracker.snapshot(200.0)["last"], None)  # window expired
+        self.assertAlmostEqual(tracker.snapshot(104.0)["fps"], 2.5)   # decays after the stop
+        late = tracker.snapshot(200.0)
+        self.assertEqual((late["fps"], late["last"]), (0.0, 101.0))   # silent window: a real 0 Hz
+        tracker.reset()
+        self.assertEqual(tracker.snapshot(200.0), {"fps": None, "last": None, "count": 11})
+
+    def test_a_real_stall_is_reported_with_its_age(self):
+        # 10 Hz for 30 s, then silence: the stall must surface as a growing frame_age_s.
+        settings = dict(SETTINGS, limits={"odometry": {"frame_age_s": {"error_above": 8.0}}})
+        tracker = health.RateTracker()
+        for i in range(301):
+            tracker.record(1000.0 + i * 0.1)
+        expectations = ((1034.9, health.OK, None), (1036.0, health.WARN, "stalled for 6.0s"),
+                        (1042.0, health.ERROR, "frame_age_s 12.000 > 8.000"))
+        for now, level, fragment in expectations:
+            with self.subTest(now=now):
+                odometry = self.build(settings=settings, now=now,
+                                      odometry=tracker.snapshot(now))["odometry"]
+                self.assertEqual(odometry["level"], level, odometry["message"])
+                self.assertIn("frame_age_s", odometry["values"])
+                if fragment:
+                    self.assertIn(fragment, odometry["message"])
+
+    def test_no_fabricated_zero_and_no_limits_while_starting(self):
+        settings = dict(SETTINGS, limits={"odometry": {"fps.delivered": {"error_below": 5.0}}})
+        statuses = self.build(settings=settings, snapshot=snapshot(session_uptime_s=2.0),
+                              odometry=stream(None, None))
+        self.assertEqual(statuses["odometry"]["level"], health.OK)
+        self.assertNotIn("fps.delivered", statuses["odometry"]["values"])
+
+    def test_restart_backoff_keeps_streams_demanded(self):
+        statuses = self.build(snapshot=snapshot(state="transitioning", session="", failures=1,
+                                                session_uptime_s=None,
+                                                detail="GLIM exited (code -11); restarting in 4s"),
+                              odometry=stream(None, None))
+        self.assertEqual(statuses["odometry"]["level"], health.WARN)
+        self.assertEqual(statuses["odometry"]["values"]["health.availability"], "retrying")
+        self.assertIn("GLIM not running", statuses["odometry"]["message"])
+        self.assertEqual(statuses["points"]["values"]["health.availability"], "current")
 
 
 if __name__ == "__main__":
