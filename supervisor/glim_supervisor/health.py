@@ -7,6 +7,8 @@ Components, each named "<instance>: <component>":
   imu       the IMU input as GLIM's subscriber sees it: fps.delivered, frame_age_s
   points    publishers on the point cloud topic (observed from the graph; no extra subscription
             to the vehicle's largest stream)
+  input     GLIM's own complaints about its input (glimlog: clock sync, per-point time, units)
+  resources the container's memory against its limit, and guard interventions
   storage   free space where map sessions are written: disk.free_gb, disk.free_pct
 Operational states are values, never levels: a confirmed standby is healthy, and streams are
 demanded whenever the target is active (including while GLIM restarts). A measurement that does
@@ -195,6 +197,51 @@ def build_statuses(*, identity, settings, snapshot, odometry, imu, points_publis
                    if points_publishers else f"no publisher on {topics['points']}")
         components.append(("points", level, message, {"publishers": points_publishers},
                            "current", {}))
+
+    # input: GLIM's own validation of the data it receives -----------------------------------
+    window = settings.get("warning_window_s", 30.0)
+    if not demanded or not running:
+        components.append(("input", OK, "input: not mapping", {}, "paused", {}))
+    else:
+        warned = snapshot.get("input_warnings") or {}
+        values = {f"glim.warnings.{c}": w["count"] for c, w in sorted(warned.items())}
+        recent = {c: w for c, w in warned.items() if w["age_s"] < window}
+        if recent:
+            level = WARN
+            message = "; ".join(f"{c} ({w['count']}x): {w['hint']}" for c, w in sorted(recent.items()))
+            latest = min(recent.values(), key=lambda w: w["age_s"])
+            values["glim.warnings.last"] = latest["message"]
+        else:
+            level = OK
+            total = sum(w["count"] for w in warned.values())
+            message = (f"no GLIM input warnings in {window:.0f}s ({total} this session)" if total
+                       else "no GLIM input warnings")
+        components.append(("input", level, message, values, "current", {}))
+
+    # resources: memory against the container's limit ----------------------------------------
+    memory = snapshot.get("memory")
+    guard = snapshot.get("guard_event") or ""
+    if not memory:
+        level, message = (WARN, guard) if guard else (OK, "memory: not measurable here")
+        components.append(("resources", level, message, {}, "unsupported", {}))
+    else:
+        values = {"memory.used_gb": memory["used_bytes"] / 1e9}
+        level = OK
+        if memory.get("limit_bytes"):
+            pct = memory["used_pct"]
+            values.update({"memory.limit_gb": memory["limit_bytes"] / 1e9, "memory.used_pct": pct})
+            messages = [f"memory {pct:.0f}% of {memory['limit_bytes'] / 1e9:.1f} GB "
+                        f"(guard at {snapshot.get('memory_guard_pct', 90):.0f}%)"]
+            if pct >= snapshot.get("memory_guard_pct", 90) - 10:
+                level = WARN
+                messages.append("approaching the memory guard")
+        else:
+            messages = [f"memory {values['memory.used_gb']:.1f} GB (no container limit)"]
+        if guard:
+            level = WARN
+            messages.append(guard)
+        level = apply_limits(level, messages, values, limits.get("resources"))
+        components.append(("resources", level, "; ".join(messages), values, "current", {}))
 
     # storage ------------------------------------------------------------------------------
     if isinstance(storage, tuple):

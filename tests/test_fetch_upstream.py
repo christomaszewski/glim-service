@@ -1,6 +1,7 @@
 """tools/fetch_upstream.py against local git fixtures: pins, verification, no partial trees."""
 import json
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -21,6 +22,8 @@ def git(*args, cwd=None):
                           text=True).stdout.strip()
 
 
+@unittest.skipUnless(shutil.which("git"), "git not available (the runtime image ships none; "
+                     "the host unit job runs these)")
 class FetchUpstreamTests(unittest.TestCase):
     def setUp(self):
         temp = tempfile.TemporaryDirectory()
@@ -63,6 +66,41 @@ class FetchUpstreamTests(unittest.TestCase):
         self.assertEqual({k: v["rev"] for k, v in sources["sources"].items()}, self.pins)
         self.assertEqual(sorted(p.name for p in self.dest.iterdir()),
                          sorted([*NAMES, "upstream-sources.json"]))   # no staging left behind
+
+    def test_patches_apply_in_order_and_are_recorded(self):
+        patches = self.root / "patches" / "glim"
+        patches.mkdir(parents=True)
+        (patches / "0001-first.patch").write_text(
+            "--- a/CMakeLists.txt\n+++ b/CMakeLists.txt\n@@ -1 +1 @@\n-# glim pinned\n+# glim patched\n")
+        fetch_upstream.fetch(self.dest, self.manifest, self.root / "patches")
+        self.assertEqual((self.dest / "glim" / "CMakeLists.txt").read_text(), "# glim patched\n")
+        recorded = json.loads((self.dest / "upstream-sources.json").read_text())["sources"]
+        self.assertEqual(recorded["glim"]["patches"][0]["file"], "0001-first.patch")
+        self.assertNotIn("patches", recorded["gtsam"])
+
+    def test_a_stale_patch_fails_the_fetch_cleanly(self):
+        patches = self.root / "patches" / "gtsam"
+        patches.mkdir(parents=True)
+        (patches / "0001-stale.patch").write_text(
+            "--- a/CMakeLists.txt\n+++ b/CMakeLists.txt\n@@ -1 +1 @@\n-# not what is there\n+# x\n")
+        with self.assertRaisesRegex(ValueError, "no longer applies"):
+            fetch_upstream.fetch(self.dest, self.manifest, self.root / "patches")
+        self.assertEqual(list(self.dest.iterdir()), [])
+
+    def test_the_repos_own_patches_apply_to_the_pinned_upstream(self):
+        # The real patch files against the real pinned commits (network; skipped offline).
+        try:
+            subprocess.run(["git", "ls-remote", "https://github.com/koide3/glim_ros2.git", "HEAD"],
+                           check=True, capture_output=True, timeout=20)
+        except (subprocess.SubprocessError, OSError):
+            self.skipTest("no network")
+        repositories = fetch_upstream.load_manifest(ROOT / "glim.repos")
+        checkout = self.root / "glim_ros2"
+        fetch_upstream.fetch_one(checkout, repositories["glim_ros2"]["url"],
+                                 repositories["glim_ros2"]["version"])
+        applied = fetch_upstream.apply_patches(checkout, ROOT / "patches" / "glim_ros2")
+        self.assertTrue(applied)
+        self.assertIn("publish_tf", (checkout / "src/glim_ros/rviz_viewer.cpp").read_text())
 
     def test_the_real_manifest_pins_full_shas(self):
         repositories = fetch_upstream.load_manifest(ROOT / "glim.repos")

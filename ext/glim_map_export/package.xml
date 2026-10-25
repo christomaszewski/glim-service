@@ -1,0 +1,15 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>glim_map_export</name>
+  <version>0.1.0</version>
+  <description>GLIM extension module: write the optimized map as a PLY point cloud when GLIM saves</description>
+  <maintainer email="christomaszewski@gmail.com">Chris Tomaszewski</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <depend>glim</depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

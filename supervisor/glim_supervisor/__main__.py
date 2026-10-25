@@ -1,9 +1,10 @@
-"""python3 -m glim_supervisor serve|state|standby|activate|health
+"""python3 -m glim_supervisor serve|state|standby|activate|health|remap <bag>...
 
-`serve` is the container's main process. The other commands are clients of its control socket:
+`serve` is the container's main process. The next four are clients of its control socket:
 `state` prints exactly one JSON object on stdout (the rig contract); `standby`/`activate` block
 until the transition completes and exit non-zero with the reason on failure; `health` is the
-Docker healthcheck (exit 0 = healthy).
+Docker healthcheck (exit 0 = healthy). `remap` maps recorded bags offline in a one-off container
+(`glim-up <config> remap <bag>`) and prints the new session's summary as JSON.
 """
 import fcntl
 import json
@@ -25,6 +26,7 @@ TARGET_SEED = os.environ.get("GLIM_TARGET_SEED", "/etc/glim/target")
 DEFAULTS_DIR = os.environ.get("GLIM_DEFAULTS_DIR", "/opt/glim/share/glim/config")
 UPSTREAM_SOURCES = os.environ.get("GLIM_UPSTREAM_SOURCES", "/opt/glim/share/upstream-sources.json")
 GLIM_BINARY = os.environ.get("GLIM_ROSNODE", "/opt/glim/lib/glim_ros/glim_rosnode")
+GLIM_ROSBAG = os.environ.get("GLIM_ROSBAG", "/opt/glim/lib/glim_ros/glim_rosbag")
 
 
 def load_instance(path=INSTANCE_FILE):
@@ -80,7 +82,7 @@ def serve():
         instance, defaults_dir=DEFAULTS_DIR, map_root=map_root, target_file=TARGET_FILE,
         initial=initial, glim_binary=GLIM_BINARY,
         provenance={**load_provenance(UPSTREAM_SOURCES), **service_identity()},
-        stop_event=stop_event)
+        stop_event=stop_event, map_store=os.environ.get("GLIM_MAP_STORE", "datadir"))
     controller.recover_interrupted()
     identity = {"vehicle_id": os.environ.get("VEHICLE_ID", ""), "instance": instance["instance"],
                 "service": instance["service"]}
@@ -136,6 +138,44 @@ def serve():
     return 0 if clean else 1
 
 
+def remap(bags):
+    """Map `bags` (rosbag2 directories) offline into a new session; -> exit code."""
+    from .controller import Controller, load_provenance, service_identity
+    instance = load_instance()
+    controller = Controller(
+        instance, defaults_dir=DEFAULTS_DIR,
+        map_root=Path(os.environ.get("GLIM_MAP_ROOT", "/var/lib/glim/store")),
+        target_file=Path("/tmp/glim-remap/target-state"),   # a one-off container: nothing to keep
+        initial="standby", provenance={**load_provenance(UPSTREAM_SOURCES), **service_identity()},
+        map_store=os.environ.get("GLIM_MAP_STORE", "datadir"))
+    processes = []
+    original = controller.process_factory
+
+    def factory(command):
+        process = original(command)
+        processes.append(process)
+        return process
+    controller.process_factory = factory
+
+    def interrupt(*_):   # stop early, but let glim_rosbag save what it has mapped so far
+        for process in processes:
+            if process.running():
+                os.killpg(process.popen.pid, signal.SIGINT)
+    signal.signal(signal.SIGTERM, interrupt)
+    signal.signal(signal.SIGINT, interrupt)
+
+    reference = None
+    if instance.get("evaluation"):
+        from .bagref import write_reference
+        topic = instance["evaluation"]["reference_topic"]
+        reference = lambda directory: write_reference(bags, topic, directory / "reference.tum")  # noqa: E731
+    record = controller.remap([Path(b) for b in bags], GLIM_ROSBAG, reference=reference)
+    print(json.dumps({key: record.get(key) for key in (
+        "session", "outcome", "exit_code", "map_saved", "map_ply_bytes", "evaluation",
+        "input_warnings")}))
+    return 0 if record["outcome"] == "saved" else 1
+
+
 def client(command):
     if command in ("standby", "activate"):
         # A standby saves the running map; allow the configured budget plus margin.
@@ -159,13 +199,20 @@ def client(command):
 def main(argv=None):
     logging.basicConfig(level=logging.INFO, format="%(name)s: %(message)s", stream=sys.stderr)
     args = sys.argv[1:] if argv is None else argv
+    if args[:1] == ["remap"] and len(args) > 1:
+        try:
+            return remap(args[1:])
+        except Exception as error:
+            LOG.error("%s", error)
+            return 1
     command = args[0] if len(args) == 1 else ""
     try:
         if command == "serve":
             return serve()
         if command in control.COMMANDS:
             return client(command)
-        raise ValueError("usage: python3 -m glim_supervisor serve|state|standby|activate|health")
+        raise ValueError("usage: python3 -m glim_supervisor serve|state|standby|activate|health"
+                         " | remap <bag>...")
     except Exception as error:
         LOG.error("%s", error)
         return 1

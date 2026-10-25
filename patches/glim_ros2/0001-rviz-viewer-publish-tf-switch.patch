@@ -1,0 +1,33 @@
+diff --git a/include/glim_ros/rviz_viewer.hpp b/include/glim_ros/rviz_viewer.hpp
+index bc02bd7..3c7591e 100644
+--- a/include/glim_ros/rviz_viewer.hpp
++++ b/include/glim_ros/rviz_viewer.hpp
+@@ -64,6 +64,7 @@ private:
+   std::string odom_frame_id;
+   std::string map_frame_id;
+   bool publish_imu2lidar;
++  bool publish_tf_enabled;  // glim-service: false = never broadcast TF (another node owns the tree)
+   double tf_time_offset;
+ 
+   std::shared_ptr<rclcpp::Publisher<sensor_msgs::msg::PointCloud2>> map_pub;
+diff --git a/src/glim_ros/rviz_viewer.cpp b/src/glim_ros/rviz_viewer.cpp
+index 9fc9253..b5c2c8a 100644
+--- a/src/glim_ros/rviz_viewer.cpp
++++ b/src/glim_ros/rviz_viewer.cpp
+@@ -29,6 +29,7 @@ RvizViewer::RvizViewer() : logger(create_module_logger("rviz")) {
+   odom_frame_id = config.param<std::string>("glim_ros", "odom_frame_id", "odom");
+   map_frame_id = config.param<std::string>("glim_ros", "map_frame_id", "map");
+   publish_imu2lidar = config.param<bool>("glim_ros", "publish_imu2lidar", true);
++  publish_tf_enabled = config.param<bool>("glim_ros", "publish_tf", true);
+   tf_time_offset = config.param<double>("glim_ros", "tf_time_offset", 1e-6);
+ 
+   last_globalmap_pub_time = rclcpp::Clock(rcl_clock_type_t::RCL_ROS_TIME).now();
+@@ -223,7 +224,7 @@ void RvizViewer::odometry_new_frame(const EstimationFrame::ConstPtr& new_frame,
+   const auto tf_stamp = from_sec(new_frame->stamp + tf_time_offset);
+   const auto imu_end_stamp = from_sec(imu_end_time);
+ 
+-  const bool publish_tf = !corrected;
++  const bool publish_tf = !corrected && publish_tf_enabled;
+   if (publish_tf) {
+     // Odom -> Base
+     geometry_msgs::msg::TransformStamped trans;

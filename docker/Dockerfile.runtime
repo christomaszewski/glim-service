@@ -50,8 +50,12 @@ WORKDIR /workspace
 # ---- sources --------------------------------------------------------------------------------------
 FROM toolchain AS sources
 COPY glim.repos /workspace/glim.repos
+COPY patches /workspace/patches
 COPY tools/fetch_upstream.py /workspace/tools/fetch_upstream.py
-RUN python3 /workspace/tools/fetch_upstream.py /workspace/src --manifest /workspace/glim.repos
+# Pinned sources, then this repo's small upstream patches (patches/<repo>/*.patch, e.g. the
+# glim_ros2 TF switch); a patch that no longer applies after a pin bump fails here.
+RUN python3 /workspace/tools/fetch_upstream.py /workspace/src --manifest /workspace/glim.repos \
+      --patches /workspace/patches
 # Only manifests feed the dependency layer: a source pin change with identical dependencies must not
 # reinstall the ROS build dependencies.
 RUN mkdir -p /workspace/deps/glim /workspace/deps/glim_ros \
@@ -77,8 +81,10 @@ ARG BUILD_JOBS
 ARG GLIM_DISABLE_CCACHE=0
 ENV CCACHE_DIR=/root/.cache/ccache CCACHE_MAXSIZE=2G CCACHE_COMPILERCHECK=content
 COPY --from=sources /workspace/src /workspace/src
-# GTSAM and gtsam_points are plain CMake projects; GLIM and its ROS node build with colcon. All four
-# install into one prefix that the runtime stage copies whole. GTSAM's -march=native defaults ON:
+# This repo's GLIM extension module (ext/glim_map_export: the headless PLY map export).
+COPY ext /workspace/ext
+# GTSAM and gtsam_points are plain CMake projects; GLIM, its ROS node and the extension build with
+# colcon. All install into one prefix that the runtime stage copies whole. GTSAM's -march=native defaults ON:
 # keep it OFF everywhere (a portable image, and GLIM segfaults when libraries disagree on it).
 RUN --mount=type=cache,id=glim-ccache-${ROS_DISTRO}-${TARGETARCH},target=/root/.cache/ccache,sharing=locked \
     if [ "${GLIM_DISABLE_CCACHE}" = 1 ]; then export CCACHE_DISABLE=1; fi \
@@ -102,7 +108,7 @@ RUN --mount=type=cache,id=glim-ccache-${ROS_DISTRO}-${TARGETARCH},target=/root/.
  && cmake --install /workspace/build/gtsam_points \
  && source "/opt/ros/${ROS_DISTRO}/setup.bash" \
  && export MAKEFLAGS="-j${JOBS}" CMAKE_BUILD_PARALLEL_LEVEL="${JOBS}" \
- && colcon build --base-paths /workspace/src/glim /workspace/src/glim_ros2 \
+ && colcon build --base-paths /workspace/src/glim /workspace/src/glim_ros2 /workspace/ext \
       --build-base /workspace/build/colcon --install-base /opt/glim --merge-install \
       --event-handlers console_direct+ \
       --cmake-args -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH=/opt/glim \
@@ -112,9 +118,9 @@ RUN --mount=type=cache,id=glim-ccache-${ROS_DISTRO}-${TARGETARCH},target=/root/.
         -DBUILD_WITH_OPENCV=OFF -DBUILD_WITH_CV_BRIDGE=OFF -DBUILD_TESTING=OFF \
  && ccache --show-stats \
  && rm -rf /opt/glim/include /opt/glim/lib/cmake /opt/glim/share/*/cmake \
- && rm -f /opt/glim/lib/glim_ros/glim_rosbag /opt/glim/lib/glim_ros/validator_node
-# (glim_rosbag and validator_node are not used by this service; shipping them would pull rosbag2
-# into the runtime for nothing. Recorded runs are processed through `rig replay`.)
+ && rm -f /opt/glim/lib/glim_ros/validator_node
+# (validator_node is unused. glim_rosbag stays: `glim-up <config> remap` maps recorded bags
+# offline with it; under the fleet-ros parent its rosbag2 libraries are already present.)
 #
 # Record what the runtime needs. GLIM's side comes from the binaries themselves: every shared
 # library the installed tree resolves outside /opt/glim, mapped to the Debian package owning it —
@@ -166,6 +172,8 @@ RUN source "/opt/ros/${ROS_DISTRO}/setup.bash" \
  && python3 /usr/local/lib/glim/check_runtime.py /opt/glim \
       --build-packages /opt/glim/share/build-ros-packages.tsv \
  && test -x /opt/glim/lib/glim_ros/glim_rosnode \
+ && test -x /opt/glim/lib/glim_ros/glim_rosbag \
+ && test -f /opt/glim/lib/libmap_export_monitor.so \
  && test -f /opt/glim/share/glim/config/config_odometry_cpu.json
 
 COPY supervisor/glim_supervisor /opt/glim_supervisor/glim_supervisor
@@ -183,6 +191,7 @@ ENV LANG=C.UTF-8 LC_ALL=C.UTF-8 \
     PYTHONPATH=/opt/glim_supervisor \
     PYTHONUNBUFFERED=1 \
     GLIM_ROSNODE=/opt/glim/lib/glim_ros/glim_rosnode \
+    GLIM_ROSBAG=/opt/glim/lib/glim_ros/glim_rosbag \
     GLIM_DEFAULTS_DIR=/opt/glim/share/glim/config \
     GLIM_SERVICE_REF=${GLIM_SERVICE_REF} \
     GLIM_SERVICE_REV=${GLIM_SERVICE_REV}

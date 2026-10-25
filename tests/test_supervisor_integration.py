@@ -313,11 +313,13 @@ class RosIntegrationTests(SupervisorProcess):
             rclpy.spin_once(self.node, timeout_sec=0.2)
         received = dict(latest)
         self.assertEqual(set(received), {f"slam: {c}" for c in
-                                         ("service", "odometry", "imu", "points", "storage")})
+                                         ("service", "odometry", "imu", "points", "input",
+                                          "resources", "storage")})
         service = received["slam: service"]
         self.assertEqual((service["op.state"], service["health.vehicle_id"],
                           service["health.service"]), ("active", "7", "glim"))
         self.assertGreater(float(received["slam: odometry"]["fps.delivered"]), 5)
+        self.assertNotIn("glim.warnings.last", received["slam: input"])   # the fake warns nothing
         self.assertEqual(self.stop(), 0)
 
 

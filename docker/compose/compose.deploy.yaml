@@ -20,6 +20,13 @@ services:
       memlock: { soft: -1, hard: -1 }
     restart: unless-stopped
     init: true                  # reap GLIM and its threads' children when the supervisor exits
+    # Opt-in limits from the config's `resources:` block; unset renders nothing (unlimited). Swap
+    # is capped at the memory limit (no swap): a swapping GLIM falls behind the sensors, and the
+    # supervisor's memory guard saves the map before this limit's OOM killer would lose it.
+    mem_limit: ${GLIM_MEM_LIMIT:-0}
+    memswap_limit: ${GLIM_MEM_LIMIT:-0}
+    cpus: ${GLIM_CPUS:-0}
+    cpuset: ${GLIM_CPUSET:-}
     # Maximum budget, not a fixed wait: GLIM finishes optimizing and serializes the map on stop.
     # Rendered from the config's map.save_timeout_s (+ margin) by the launcher.
     stop_grace_period: ${GLIM_STOP_GRACE:-300s}
@@ -40,6 +47,7 @@ services:
       VEHICLE_ID: ${VEHICLE_ID:-}
       # where map sessions are written; compose.datadir.yaml points it at the vehicle data dir
       GLIM_MAP_ROOT: /var/lib/glim/store
+      GLIM_MAP_STORE: volume      # map.keep_sessions retention applies only to this fallback store
     volumes:
       # The rendered instance file and the startup target (RIG_TARGET_STATE > initial_state >
       # active), read-only single-file mounts. The target file sits at a fixed path, so a changed

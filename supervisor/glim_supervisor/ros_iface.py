@@ -112,6 +112,27 @@ class SupervisorNode(LifecycleNodeMixin, Node):
         self.diagnostics = self.create_publisher(
             DiagnosticArray, "/diagnostics",
             QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE))
+
+        # extrinsics.from_tf: the vehicle's TF tree is the source of T_lidar_imu
+        self.tf_buffer = None
+        if (instance.get("extrinsics") or {}).get("source") == "tf":
+            from tf2_ros.buffer import Buffer
+            from tf2_ros.transform_listener import TransformListener
+            self.tf_buffer = Buffer()
+            self.tf_listener = TransformListener(self.tf_buffer, self, spin_thread=False)
+
+        # evaluation: record the reference trajectory beside the running session
+        self.reference_lock = threading.Lock()
+        self.reference_file = None
+        self.reference_dir = None
+        self.reference_last = None
+        self.reference_lines = 0
+        evaluation = instance.get("evaluation")
+        if evaluation:
+            self.create_subscription(Odometry, _resolve(self.namespace_, evaluation["reference_topic"]),
+                                     self.on_reference,
+                                     QoSProfile(depth=50, reliability=ReliabilityPolicy.BEST_EFFORT),
+                                     callback_group=MutuallyExclusiveCallbackGroup())
         self.create_timer(self.settings["interval_s"], self.publish_health, callback_group=monitors)
 
     # --- lifecycle -----------------------------------------------------------------------
@@ -187,6 +208,51 @@ class SupervisorNode(LifecycleNodeMixin, Node):
         finally:
             self.sync_thread = None
 
+    # --- extrinsics / evaluation ----------------------------------------------------------
+    def lookup_extrinsic(self, lidar_frame, imu_frame, timeout_s=10.0):
+        """T_lidar_imu ([x y z qx qy qz qw], p_lidar = T * p_imu) from TF; raises if unavailable."""
+        from rclpy.duration import Duration
+        from rclpy.time import Time
+        try:
+            stamped = self.tf_buffer.lookup_transform(lidar_frame, imu_frame, Time(),
+                                                      timeout=Duration(seconds=timeout_s))
+        except Exception as error:
+            raise RuntimeError(f"no TF {lidar_frame} <- {imu_frame} within {timeout_s:.0f}s "
+                               f"(is the vehicle's static TF published?): {error}") from None
+        t, q = stamped.transform.translation, stamped.transform.rotation
+        return [t.x, t.y, t.z, q.x, q.y, q.z, q.w]
+
+    def on_reference(self, message):
+        session = self.controller.session
+        with self.reference_lock:
+            if session is None:
+                self._close_reference()
+                return
+            if self.reference_dir != session.directory:
+                self._close_reference()
+                self.reference_file = open(session.directory / "reference.tum", "a")
+                self.reference_dir = session.directory
+            stamp = message.header.stamp.sec + message.header.stamp.nanosec * 1e-9
+            if self.reference_last is not None and stamp - self.reference_last < 0.018:
+                return   # <= 50 Hz (stamp jitter aside) is plenty to score a 10 Hz trajectory
+            self.reference_last = stamp
+            p, q = message.pose.pose.position, message.pose.pose.orientation
+            self.reference_file.write(f"{stamp:.9f} {p.x:.6f} {p.y:.6f} {p.z:.6f} "
+                                      f"{q.x:.9f} {q.y:.9f} {q.z:.9f} {q.w:.9f}\n")
+            self.reference_lines += 1
+            if self.reference_lines % 25 == 0:
+                self.reference_file.flush()
+
+    def _close_reference(self):
+        if self.reference_file is not None:
+            self.reference_file.close()
+        self.reference_file = self.reference_dir = self.reference_last = None
+
+    def close_reference(self, session=None):
+        """Session-end hook: the reference must be complete before the session is scored."""
+        with self.reference_lock:
+            self._close_reference()
+
     # --- graph / health ------------------------------------------------------------------
     def glim_visible(self):
         try:
@@ -240,6 +306,9 @@ class RosInterface:
         # The supervisor owns signal handling: SIGTERM must save the map, not kill the context.
         rclpy.init(args=None, signal_handler_options=SignalHandlerOptions.NO)
         self.node = SupervisorNode(controller, instance, identity, map_root)
+        if self.node.tf_buffer is not None:
+            controller.extrinsic_resolver = self.node.lookup_extrinsic
+        controller.session_end_hooks.append(self.node.close_reference)
         self.executor = MultiThreadedExecutor(num_threads=4)
         self.executor.add_node(self.node)
         self.stopping = threading.Event()

@@ -15,6 +15,9 @@
 #   glim-up autonomy/slam.yaml standby       # save the map, stop GLIM; container stays up
 #   glim-up autonomy/slam.yaml activate      # start a NEW mapping session
 #   glim-up autonomy/slam.yaml state         # {"state": ...} JSON on stdout (read-only)
+#   glim-up autonomy/slam.yaml remap <bag>...   # map recorded rosbag2 dirs offline, max speed
+#   glim-up autonomy/slam.yaml evaluate <session-dir>   # ATE vs the session's reference.tum
+#   glim-up autonomy/slam.yaml export        # rig run export's verb (RIG_EXPORT_* env)
 #
 # Multiple instances = run it per config; each is its own compose project + ROS namespace, so
 # instances never collide. This repo does NOT depend on rig (one-way; see rigging.yaml).
@@ -58,14 +61,15 @@ esac
 # so a later edit that broke some other block can never strand a running instance — `down`, `ps`,
 # `logs` and the state verbs still reach it.
 STRICT=(--lenient)
-case "${ARGS[0]}" in up|create|run|config) STRICT=() ;; esac
+case "${ARGS[0]}" in up|create|run|config|remap) STRICT=() ;; esac
 ENV_FILE="$(mktemp)"
 trap 'rm -f "$ENV_FILE"' EXIT
 "$PYTHON" "$REPO/tools/render_config.py" --env0 ${STRICT[@]+"${STRICT[@]}"} "$CONFIG_ABS" > "$ENV_FILE"
 while IFS= read -r -d '' key; do
   IFS= read -r -d '' value || { echo "glim-up: truncated environment data" >&2; exit 1; }
   case "$key" in
-    SERVICE|NAME|NAMESPACE|INITIAL_STATE|STOP_GRACE_S|ZENOH_OVERRIDE) export "$key=$value" ;;
+    SERVICE|NAME|NAMESPACE|INITIAL_STATE|STOP_GRACE_S|ZENOH_OVERRIDE|MEM_LIMIT|CPUS|CPUSET)
+      export "$key=$value" ;;
     *) echo "glim-up: unexpected environment key: $key" >&2; exit 1 ;;
   esac
 done < "$ENV_FILE"
@@ -78,7 +82,7 @@ PROJECT="${SERVICE}_${NAME}"
 # Inspection and teardown only compute the path; they never write files a container mounts.
 INSTANCE_HOST="$REPO/var/run/${NAME}.instance.json"
 case "${ARGS[0]}" in
-  up|create|run|config)
+  up|create|run|config|remap)
     INSTANCE_CONTENT="$("$PYTHON" "$REPO/tools/render_config.py" --instance --sim-time "${RIG_SIM_TIME:-}" "$CONFIG_ABS")"
     INSTANCE_HASH="$(printf '%s\n' "$INSTANCE_CONTENT" | "$PYTHON" -c 'import hashlib, sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest()[:16])')"
     INSTANCE_HOST="$REPO/var/run/${NAME}.${INSTANCE_HASH}.instance.json"
@@ -89,9 +93,22 @@ esac
 # RIG_IMAGE_REGISTRY -> local glim:latest), so a standalone run needs no rig and no registry.
 export GLIM_INSTANCE_HOST="$INSTANCE_HOST"
 export GLIM_NAME="$NAME"
+
+# Host-side verbs: no container involved.
+case "${ARGS[0]}" in
+  export)   # rig run export (rigging.yaml export:) — everything arrives in RIG_EXPORT_* env
+    exec "$PYTHON" "$REPO/tools/export_maps.py" ;;
+  evaluate)
+    SESSION="${ARGS[1]:?usage: glim-up <config> evaluate <session-dir> [reference.tum]}"
+    ESTIMATE="$SESSION/dump/traj_imu.txt"
+    [ -f "$ESTIMATE" ] || ESTIMATE="$SESSION/dump/odom_imu.txt"
+    exec "$PYTHON" "$REPO/tools/eval_trajectory.py" "$ESTIMATE" "${ARGS[2]:-$SESSION/reference.tum}" ;;
+esac
 export GLIM_NAMESPACE="$NAMESPACE"
 export GLIM_STOP_GRACE="${STOP_GRACE_S}s"
 export GLIM_ZENOH_OVERRIDE="$ZENOH_OVERRIDE"
+# Optional container limits from the config's `resources:` block (empty = unlimited).
+export GLIM_MEM_LIMIT="$MEM_LIMIT" GLIM_CPUS="$CPUS" GLIM_CPUSET="$CPUSET"
 
 FILES=(-f "$REPO/docker/compose/compose.deploy.yaml")
 # Map storage: the vehicle data dir when rig exports one (run-aware: the supervisor writes under
@@ -159,7 +176,7 @@ if [ "${ARGS[0]}" = up ] && [ "${RIG_RUNTIME_IMAGE_PINS+x}" ]; then
   "$PYTHON" "$REPO/tools/runtime_images.py" validate-pins "${FILES[@]}" -- "${ARGS[@]:1}"
 fi
 case "${ARGS[0]}" in
-  up|create|run|config)
+  up|create|run|config|remap)
     # Bake needs the rendered file bind; queries above only calculate its path. Atomic replace:
     # a container restarting mid-write must never read a truncated instance file.
     mkdir -p "$REPO/var/run"
@@ -188,7 +205,27 @@ case "${ARGS[0]}" in
     ;;
 esac
 # Only startup creates the per-instance fallback map volume; inspection never does.
-[ "${ARGS[0]}" = "up" ] && docker volume create "glim_${NAME}_maps" >/dev/null
+case "${ARGS[0]}" in up|remap) docker volume create "glim_${NAME}_maps" >/dev/null ;; esac
+
+# Offline remap: glim_rosbag reads the bags directly at full speed, in a one-off container of this
+# project with the same mounts, so the session lands where live sessions do. Isolated from the ROS
+# graph (Fast DDS with discovery off): its node and TF must never meet the live instance's.
+if [ "${ARGS[0]}" = remap ]; then
+  [ ${#ARGS[@]} -ge 2 ] || { echo "glim-up: usage: glim-up <config> remap <rosbag2-dir>..." >&2; exit 2; }
+  MOUNTS=()
+  INPUTS=()
+  for ((i = 1; i < ${#ARGS[@]}; i++)); do
+    BAG="${ARGS[i]}"
+    [ -e "$BAG" ] || { echo "glim-up: remap: no such bag: $BAG" >&2; exit 2; }
+    BAG_ABS="$(cd "$(dirname "$BAG")" && pwd)/$(basename "$BAG")"
+    MOUNTS+=(-v "$BAG_ABS:/remap/input/$i:ro")
+    INPUTS+=("/remap/input/$i")
+  done
+  echo "glim-up: remapping ${#INPUTS[@]} bag(s) for $COMPOSE_PROJECT_NAME (offline, isolated from ROS)" >&2
+  exec docker compose "${FILES[@]}" run --rm --no-deps -T "${MOUNTS[@]}" \
+    -e RMW_IMPLEMENTATION=rmw_fastrtps_cpp -e ROS_AUTOMATIC_DISCOVERY_RANGE=OFF \
+    glim python3 -m glim_supervisor remap "${INPUTS[@]}"
+fi
 
 # Compose down neither propagates the stopped container's exit status nor keeps its logs. Stop
 # first so a failed map save (non-zero supervisor exit, or SIGKILL past the grace period) is

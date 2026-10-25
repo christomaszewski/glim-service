@@ -42,6 +42,10 @@ inputs:
 # it is FRD and the rotation must say so.
 extrinsics:
   T_lidar_imu: [0.0, 0.0, -0.10, 0.0, 0.0, 0.0, 1.0]
+  # from_tf: true               # instead of T_lidar_imu: look it up in the vehicle's TF tree (URDF /
+                                # static TF) at every session start — one source of truth. Needs
+                                # frames.imu and frames.lidar named; the session fails to start if
+                                # the transform is not published within 10 s.
 
 # TF that GLIM broadcasts: map -> odom -> base (always), and imu -> lidar (optional). A frame can
 # have only ONE parent, so decide who owns each edge before enabling this on a vehicle.
@@ -56,6 +60,9 @@ frames:
   # lidar: ""                   # "" = header.frame_id of the point clouds
   publish_imu_to_lidar: false   # true only if nothing else (URDF, the Ouster's static TF) connects
                                 # the lidar frame; otherwise the lidar frame gets a second parent
+  publish_tf: true              # false = GLIM broadcasts no TF at all (odometry/pose topics only):
+                                # for a vehicle whose localization node owns map/odom, or when GLIM
+                                # runs beside another estimator for comparison
 
 # GLIM module preset (all CPU — this image is built without CUDA):
 #   lightweight  odometry_cpu + sub_mapping_passthrough + global_mapping_pose_graph (real-time on an
@@ -88,22 +95,50 @@ glim:
 
 # Map sessions: <data dir>/current/maps/<name>/<session>/ when rig exports RIG_DATA_DIR and a run is
 # open (flat <data dir>/maps/<name>/<session>/ otherwise), else the glim_<name>_maps volume. Each
-# session holds session.json, the exact GLIM config used, GLIM's logs and its dump/ (open it with
-# GLIM's offline_viewer). GLIM finishes optimizing and saves on standby/down; this bounds that.
+# session holds session.json, the exact GLIM config used, GLIM's logs, its dump/ (open it with
+# GLIM's offline_viewer) and map.ply. GLIM finishes optimizing and saves on standby/down.
 map:
-  save_timeout_s: 240           # also sizes the container stop grace period (+30 s)
+  save_timeout_s: 240           # bounds that save; also sizes the container stop grace (+30 s)
+  min_free_gb: 1.0              # a session will not START below this much free space, and a
+                                # running one is stopped (map saved) if the disk falls below it
+  keep_sessions: 0              # 0 = keep all. N = keep the newest N sessions in the fallback
+                                # volume (a data dir is rig's to manage: never pruned)
+  export_ply: true              # also write the optimized global map as <session>/map.ply (binary
+                                # PLY, world frame) for tools that cannot read GLIM's dump
+  export_voxel_m: 0.1           # PLY voxel size in metres (0 = every point; large on long runs)
+
+# Container limits. GLIM's global map grows with the run, and an OOM kill loses the whole session.
+# The memory guard stops the session (saving its map) at memory_guard_pct of the limit and starts
+# a new one, so a long run degrades into consecutive maps instead of a lost one.
+# resources:
+#   memory_limit_gb: 6          # docker mem_limit (no swap); unset = no limit (guard inactive)
+#   memory_guard_pct: 90        # 50..99, of memory_limit_gb
+#   cpus: 4                     # docker --cpus quota
+#   cpuset: "4-7"               # pin to cores (e.g. away from the lidar driver's)
+
+# Accuracy against a reference trajectory, typically the INS's fused odometry. The supervisor
+# records the topic beside each session (reference.tum) and, after the map is saved, scores GLIM's
+# trajectory against it (rigid alignment, absolute trajectory error) into evaluation.json and
+# session.json. `glim-up <cfg> remap` reads the same topic from the bags. Needs one clock for both.
+# evaluation:
+#   reference_topic: /ins_main/odom    # nav_msgs/Odometry (sbg instance ins_main)
+#   max_dt_s: 0.05                     # pose association tolerance
 
 # Health on /diagnostics (fleet contract, ouster docs/SERVICE_HEALTH.md): components service,
-# odometry, imu, points and storage under "<name>: <component>". Stalls only WARN by default.
+# odometry, imu, points, input, resources and storage under "<name>: <component>". `input` WARNs
+# while GLIM itself reports bad input (unsynced clocks, IMU gaps, missing per-point time, ...),
+# with a hint naming the likely cause. Stalls only WARN by default.
 health:
   interval_s: 1                 # heartbeat period
   stall_timeout_s: 5            # silence on odometry / IMU while active that counts as stalled
+  warning_window_s: 30          # how long a GLIM input warning keeps `input` at WARN
   # expected_odometry_hz: 10    # lidar frame rate; reported as fps.expected
   limits: {}
   # limits:                     # producer-side thresholds; strict > / <, ERROR wins over WARN
   #   odometry: {fps.delivered: {warn_below: 8.0}, frame_age_s: {error_above: 10.0}}
   #   imu: {fps.delivered: {warn_below: 100.0}}
   #   storage: {disk.free_gb: {warn_below: 20.0, error_below: 5.0}}
+  #   resources: {memory.used_gb: {warn_above: 5.0}}
 
 # Zenoh session settings (only consumed with RMW_IMPLEMENTATION=rmw_zenoh_cpp), the same block the
 # ouster wrapper and bag logger take. Point clouds are the largest messages on the vehicle: enable

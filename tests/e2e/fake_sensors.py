@@ -2,7 +2,8 @@
 
 /top/points: sensor_msgs/PointCloud2 (x, y, z, intensity float32; t uint32 ns since scan start)
 at 10 Hz in frame ouster_lidar; /ins_main/imu/data: sensor_msgs/Imu at 200 Hz in frame imu_link,
-at rest (specific force +g on z). The scene is a furnished 12 x 9 x 3 m room so scan matching has
+at rest (specific force +g on z); /ins_main/odom: nav_msgs/Odometry at 50 Hz, the INS's (static)
+fused pose, as the evaluation reference. The scene is a furnished 12 x 9 x 3 m room so scan matching has
 structure in every direction.
 """
 import random
@@ -11,6 +12,7 @@ import struct
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
+from nav_msgs.msg import Odometry
 from sensor_msgs.msg import Imu, PointCloud2, PointField
 
 random.seed(7)
@@ -60,6 +62,8 @@ class FakeSensors(Node):
         super().__init__("fake_sensors")
         self.points = self.create_publisher(PointCloud2, "/top/points", qos_profile_sensor_data)
         self.imu = self.create_publisher(Imu, "/ins_main/imu/data", qos_profile_sensor_data)
+        self.odom = self.create_publisher(Odometry, "/ins_main/odom", qos_profile_sensor_data)
+        self.create_timer(0.02, self.publish_odom)
         self.scene = room_points(60000)
         self.create_timer(0.1, self.publish_scan)
         self.create_timer(0.005, self.publish_imu)
@@ -85,6 +89,14 @@ class FakeSensors(Node):
         msg.is_dense = True
         msg.data = bytes(data)
         self.points.publish(msg)
+
+    def publish_odom(self):
+        msg = Odometry()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = "odom"
+        msg.child_frame_id = "base_link"
+        msg.pose.pose.orientation.w = 1.0
+        self.odom.publish(msg)
 
     def publish_imu(self):
         msg = Imu()

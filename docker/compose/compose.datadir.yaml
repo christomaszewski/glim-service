@@ -7,5 +7,6 @@ services:
   glim:
     environment:
       GLIM_MAP_ROOT: /data
+      GLIM_MAP_STORE: datadir
     volumes:
       - ${GLIM_DATA_HOST}:/data

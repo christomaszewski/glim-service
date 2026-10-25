@@ -169,6 +169,74 @@ class RenderInstanceTests(unittest.TestCase):
         self.assertEqual(out["glim"]["glim_ros"]["extension_modules"], [])
 
 
+class TfAndEvaluationTests(unittest.TestCase):
+    def test_extrinsic_from_tf_needs_named_frames(self):
+        cfg = example()
+        cfg["extrinsics"] = {"from_tf": True}
+        with self.assertRaisesRegex(rc.ConfigError, "frames.imu and frames.lidar"):
+            rc.render_instance(cfg)
+        cfg["frames"].update(imu="imu_link", lidar="ouster_lidar")
+        out = rc.render_instance(cfg)
+        self.assertEqual(out["extrinsics"], {"source": "tf", "imu_frame": "imu_link",
+                                             "lidar_frame": "ouster_lidar"})
+        self.assertNotIn("T_lidar_imu", out["glim"]["sensors"])
+        cfg["extrinsics"]["T_lidar_imu"] = [0, 0, 0, 0, 0, 0, 1]
+        with self.assertRaisesRegex(rc.ConfigError, "not both"):
+            rc.render_instance(cfg)
+
+    def test_publish_tf_switch(self):
+        cfg = example()
+        self.assertTrue(rc.render_instance(cfg)["glim"]["glim_ros"]["publish_tf"])
+        cfg["frames"]["publish_tf"] = False
+        self.assertFalse(rc.render_instance(cfg)["glim"]["glim_ros"]["publish_tf"])
+        cfg = example()
+        cfg["glim"]["ros"] = {"publish_tf": False}
+        with self.assertRaisesRegex(rc.ConfigError, "frames.publish_tf"):
+            rc.render_instance(cfg)
+
+    def test_evaluation_block(self):
+        self.assertIsNone(rc.render_instance(example())["evaluation"])
+        cfg = example()
+        cfg["evaluation"] = {"reference_topic": "/ins_main/odom"}
+        self.assertEqual(rc.render_instance(cfg)["evaluation"],
+                         {"reference_topic": "/ins_main/odom", "max_dt_s": 0.05})
+        cfg["evaluation"] = {"reference_topic": "not a topic!"}
+        with self.assertRaises(rc.ConfigError):
+            rc.render_instance(cfg)
+
+
+class ResourceAndMapTests(unittest.TestCase):
+    def test_limits_render_into_env_and_guard_into_the_instance(self):
+        cfg = example()
+        cfg["resources"] = {"memory_limit_gb": 6, "cpus": 4, "cpuset": "4-7", "memory_guard_pct": 85}
+        env = dict(rc.render_env(cfg, warn=False))
+        self.assertEqual((env["MEM_LIMIT"], env["CPUS"], env["CPUSET"]), ("6144m", "4", "4-7"))
+        self.assertEqual(rc.render_instance(cfg)["resources"],
+                         {"memory_guard_pct": 85.0, "memory_limit_gb": 6.0})
+        env = dict(rc.render_env(example(), warn=False))
+        self.assertEqual((env["MEM_LIMIT"], env["CPUS"], env["CPUSET"]), ("", "", ""))
+
+    def test_resource_validation(self):
+        for block, fragment in (({"cpuset": "four"}, "CPU list"), ({"memory_guard_pct": 100}, "below 100"),
+                                ({"memory_guard_pct": 20}, ">= 50"), ({"memory_limit_gb": 0}, "positive"),
+                                ({"swap": 1}, "unknown resources key")):
+            with self.subTest(block=block):
+                cfg = example()
+                cfg["resources"] = block
+                with self.assertRaises(rc.ConfigError) as caught:
+                    rc.render_env(cfg, warn=False)
+                self.assertIn(fragment, str(caught.exception))
+
+    def test_map_guards_and_export_defaults(self):
+        out = rc.render_instance(example())["map"]
+        self.assertEqual(out, {"save_timeout_s": 240.0, "min_free_gb": 1.0, "keep_sessions": 0,
+                               "export_ply": True, "export_voxel_m": 0.1})
+        cfg = example()
+        cfg["map"] = {"keep_sessions": -1}
+        with self.assertRaises(rc.ConfigError):
+            rc.render_instance(cfg)
+
+
 class YamlTypeTests(unittest.TestCase):
     """YAML is generous with types (`no` is False, `2026-10-23` a date, `.inf` a float)."""
 
@@ -252,6 +320,18 @@ class CommandLineTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertEqual(result.stdout, b"")
         self.assertIn(b"slam.yaml: extrinsics.T_lidar_imu is required", result.stderr)
+
+    def test_a_repeated_key_is_an_error_not_a_silent_override(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "slam.yaml"
+            text = EXAMPLE.read_text().replace("  publish_tf: true", "  publish_tf: false\n  publish_tf: true")
+            self.assertNotEqual(text, EXAMPLE.read_text())
+            path.write_text(text)
+            result = subprocess.run([sys.executable, str(ROOT / "tools/render_config.py"),
+                                     "--instance", str(path)], capture_output=True, timeout=30)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, b"")
+        self.assertIn(b"duplicate key 'publish_tf'", result.stderr)
 
     def test_values_json_cannot_carry_exit_cleanly(self):
         for value in (float("inf"), float("nan")):

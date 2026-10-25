@@ -37,7 +37,8 @@ class HealthTests(unittest.TestCase):
 
     def test_healthy_active_instance(self):
         statuses = self.build()
-        self.assertEqual(set(statuses), {"service", "odometry", "imu", "points", "storage"})
+        self.assertEqual(set(statuses), {"service", "odometry", "imu", "points", "input",
+                                         "resources", "storage"})
         for status in statuses.values():
             self.assertEqual(status["level"], health.OK, status)
             values = status["values"]
@@ -89,6 +90,35 @@ class HealthTests(unittest.TestCase):
                                                 save_error="session S: save_timeout (exit -9)"))
         self.assertEqual(statuses["service"]["level"], health.WARN)
         self.assertIn("last map save incomplete", statuses["service"]["message"])
+
+    def test_glims_input_warnings_surface_while_recent(self):
+        warned = {"time_sync": {"count": 12, "age_s": 3.0, "message": "large time difference...",
+                                "hint": "put both on one clock"}}
+        statuses = self.build(snapshot=snapshot(input_warnings=warned))
+        self.assertEqual(statuses["input"]["level"], health.WARN)
+        self.assertIn("time_sync (12x): put both on one clock", statuses["input"]["message"])
+        self.assertEqual(statuses["input"]["values"]["glim.warnings.time_sync"], "12")
+        warned["time_sync"]["age_s"] = 300.0
+        statuses = self.build(snapshot=snapshot(input_warnings=warned))
+        self.assertEqual(statuses["input"]["level"], health.OK)
+        self.assertIn("12 this session", statuses["input"]["message"])
+
+    def test_memory_against_the_container_limit(self):
+        def memory(used_gb, limit_gb):
+            reading = {"used_bytes": used_gb * 1e9, "limit_bytes": limit_gb * 1e9 if limit_gb else None}
+            if limit_gb:
+                reading["used_pct"] = 100.0 * used_gb / limit_gb
+            return reading
+        ok = self.build(snapshot=snapshot(memory=memory(2, 8), memory_guard_pct=90))["resources"]
+        self.assertEqual((ok["level"], ok["values"]["memory.used_pct"]), (health.OK, "25.000"))
+        near = self.build(snapshot=snapshot(memory=memory(6.6, 8), memory_guard_pct=90))["resources"]
+        self.assertEqual(near["level"], health.WARN)
+        guarded = self.build(snapshot=snapshot(memory=memory(1, 8), memory_guard_pct=90,
+                                               guard_event="memory guard: ...; ended session S"))
+        self.assertIn("ended session S", guarded["resources"]["message"])
+        unlimited = self.build(snapshot=snapshot(memory=memory(3, None)))["resources"]
+        self.assertIn("no container limit", unlimited["message"])
+        self.assertNotIn("memory.used_pct", unlimited["values"])
 
     def test_producer_limits(self):
         settings = dict(SETTINGS, expected_odometry_hz=10.0, limits={

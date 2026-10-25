@@ -1,7 +1,9 @@
 """The supervisor's state machine, process ownership and session records — no ROS, no GLIM."""
+import copy
 import json
 import os
 from pathlib import Path
+import shutil
 import signal
 import sys
 import tempfile
@@ -20,7 +22,8 @@ INSTANCE = {
     "use_sim_time": False, "pipeline": "lightweight",
     "inputs": {"points": "/top/points", "imu": "/ins_main/imu/data"},
     "glim": {"glim_ros": {"points_topic": "/top/points"}},
-    "map": {"save_timeout_s": 5.0},
+    "map": {"save_timeout_s": 5.0, "min_free_gb": 1.0, "keep_sessions": 0},
+    "resources": {"memory_guard_pct": 90.0},
     "health": {"interval_s": 1.0, "stale_after_s": 5.0, "stall_timeout_s": 5.0, "limits": {}},
 }
 
@@ -88,17 +91,22 @@ class ControllerTests(unittest.TestCase):
         self.map_root = self.root / "data"
         self.map_root.mkdir()
         self.clock = Clock()
+        self.wall_now = 1792000000.0
+        self.memory = {"used_bytes": 1 << 30, "limit_bytes": 8 << 30}
+        self.free_gb = 100.0
         FakeProcess.instances = []
         self.compose = ctl.glimconfig.compose
         ctl.glimconfig.compose = fake_compose
         self.addCleanup(setattr, ctl.glimconfig, "compose", self.compose)
 
-    def make(self, initial="active", **kwargs):
+    def make(self, initial="active", instance=None, **kwargs):
+        kwargs.setdefault("memory_probe", lambda: self.memory)
+        kwargs.setdefault("disk_probe", lambda path: (self.free_gb, 50.0))
         controller = ctl.Controller(
-            INSTANCE, defaults_dir=self.root, map_root=self.map_root,
+            instance or INSTANCE, defaults_dir=self.root, map_root=self.map_root,
             target_file=self.root / "state/target", initial=initial,
             process_factory=lambda command: FakeProcess(command, self.clock),
-            clock=self.clock, wall=lambda: 1792000000.0, startup_timeout_s=10, **kwargs)
+            clock=self.clock, wall=lambda: self.wall_now, startup_timeout_s=10, **kwargs)
         # blocking waits use stop_event.wait; advance the fake clock instead of sleeping
         controller._pause = lambda seconds: self.clock.advance(seconds)
         return controller
@@ -383,6 +391,141 @@ class ControllerTests(unittest.TestCase):
         self.assertTrue(controller.health()[0])
         self.assertEqual(controller.failures, 0)
 
+    def test_memory_guard_saves_and_continues_with_a_fresh_map(self):
+        controller = self.make()
+        controller.transition("active")
+        first = FakeProcess.instances[-1]
+        self.memory = {"used_bytes": int(7.3 * (1 << 30)), "limit_bytes": 8 << 30}   # 91%
+        controller.tick()
+        record = self.session_record(first)
+        self.assertEqual((record["outcome"], record["ended_by"], record["map_saved"]),
+                         ("saved", "memory guard", True))
+        self.memory = {"used_bytes": 1 << 30, "limit_bytes": 8 << 30}
+        controller.tick()
+        self.assertEqual(len(FakeProcess.instances), 2)            # mapping continues
+        self.assertIn("memory guard", controller.snapshot()["guard_event"])
+        self.assertTrue(controller.health()[0])                     # not a failure
+
+    def test_disk_guard_refuses_to_start_and_ends_a_running_session(self):
+        controller = self.make(initial="standby")
+        self.free_gb = 0.4
+        with self.assertRaisesRegex(RuntimeError, "only 0.40 GB free"):
+            controller.transition("active")
+        self.assertFalse((self.map_root / "maps").exists())       # nothing written to a full disk
+        self.free_gb = 50.0
+        controller.transition("active")
+        self.free_gb = 0.5
+        controller.tick()
+        self.assertEqual(self.session_record(FakeProcess.instances[-1])["ended_by"], "disk guard")
+        controller.tick()
+        self.assertEqual(len(FakeProcess.instances), 1)            # held until space returns
+        self.free_gb = 50.0
+        self.clock.advance(100)
+        controller.tick()
+        self.assertEqual(len(FakeProcess.instances), 2)
+
+    def test_retention_applies_to_the_fallback_volume_only(self):
+        instance = dict(INSTANCE, map=dict(INSTANCE["map"], keep_sessions=2))
+        for store, expected in (("datadir", 4), ("volume", 2)):
+            with self.subTest(store=store):
+                shutil.rmtree(self.map_root / "maps", ignore_errors=True)
+                controller = self.make(instance=instance, map_store=store)
+                for i in range(4):
+                    self.wall_now = 1792000000.0 + 60 * i
+                    controller.transition("active")
+                    controller.transition("standby")
+                self.assertEqual(len(list((self.map_root / "maps/slam").iterdir())), expected)
+
+    def test_heartbeat_and_orphan_closeout(self):
+        controller = self.make()
+        controller.transition("active")
+        self.clock.advance(31)
+        self.wall_now += 31
+        controller.tick()
+        session_dir = FakeProcess.instances[-1].dump.parent
+        self.assertEqual(self.session_record(FakeProcess.instances[-1])["heartbeat_unix"], self.wall_now)
+        # its supervisor dies with the container (no marker survives); a new one starts later
+        (self.root / "state").joinpath("current-session").unlink()
+        self.wall_now += 60
+        fresh = self.make()
+        fresh.recover_interrupted()
+        self.assertEqual(json.loads((session_dir / "session.json").read_text())["outcome"], "running")
+        self.wall_now += 120                                         # heartbeat now stale
+        fresh.recover_interrupted()
+        self.assertEqual(json.loads((session_dir / "session.json").read_text())["outcome"],
+                         "interrupted")
+
+    def test_input_warnings_are_per_session(self):
+        controller = self.make()
+        controller.transition("active")
+        FakeProcess.instances[-1].on_line("large time difference between points and imu!!")
+        self.assertIn("time_sync", controller.snapshot()["input_warnings"])
+        controller.transition("standby")
+        controller.transition("active")
+        self.assertEqual(controller.snapshot()["input_warnings"], {})
+
+    def test_extrinsic_is_read_from_tf_at_session_start(self):
+        instance = copy.deepcopy(INSTANCE)
+        instance["extrinsics"] = {"source": "tf", "lidar_frame": "ouster_lidar", "imu_frame": "imu_link"}
+        controller = self.make(initial="standby", instance=instance)
+        with self.assertRaisesRegex(RuntimeError, "needs the ROS interface"):
+            controller.transition("active")
+        asked = []
+        controller.extrinsic_resolver = lambda lidar, imu: asked.append((lidar, imu)) or [0, 0, -0.1, 0, 0, 0, 1]
+        controller.transition("active")
+        record = self.session_record(FakeProcess.instances[-1])
+        self.assertEqual(asked, [("ouster_lidar", "imu_link")])
+        self.assertEqual(record["extrinsics"]["source"], "tf")
+        self.assertEqual(record["extrinsics"]["T_lidar_imu"], [0, 0, -0.1, 0, 0, 0, 1])
+
+    def test_finished_sessions_are_scored_against_their_reference(self):
+        instance = copy.deepcopy(INSTANCE)
+        instance["evaluation"] = {"reference_topic": "/ins_main/odom", "max_dt_s": 0.05}
+        controller = self.make(instance=instance)
+        closed = []
+        controller.session_end_hooks.append(lambda session: closed.append(session.id))
+        controller.transition("active")
+        process = FakeProcess.instances[-1]
+        session_dir = process.dump.parent
+        poses = "".join(f"{100 + i * 0.1:.3f} {i * 0.5:.3f} 0 0 0 0 0 1\n" for i in range(50))
+        (session_dir / "reference.tum").write_text(poses)
+        original = process.stop
+
+        def stop_and_write_trajectory(budget):
+            result = original(budget)
+            (process.dump / "traj_imu.txt").write_text(poses)
+            return result
+        process.stop = stop_and_write_trajectory
+        controller.transition("standby")
+        record = self.session_record(process)
+        self.assertEqual(closed, [session_dir.name])
+        self.assertLess(record["evaluation"]["ate_rmse_m"], 1e-6)
+        self.assertTrue((session_dir / "evaluation.json").is_file())
+
+    def test_remap_runs_glim_rosbag_into_a_new_session(self):
+        class Rosbag(FakeProcess):
+            def start(self):
+                super().start()
+                self.dump.mkdir(parents=True)
+                (self.dump / "graph.bin").write_text("map")
+                self.on_line("[glim] [warning] large time gap between consecutive LiDAR frames!!")
+                self.crash(0)   # glim_rosbag exits by itself when the bags end (auto_quit)
+        controller = ctl.Controller(
+            INSTANCE, defaults_dir=self.root, map_root=self.map_root,
+            target_file=self.root / "state/target", process_factory=lambda c: Rosbag(c, self.clock),
+            clock=self.clock, wall=lambda: self.wall_now, memory_probe=lambda: None,
+            disk_probe=lambda path: (100.0, 50.0))
+        references = []
+        record = controller.remap([Path("/remap/input/bag_0")], "glim_rosbag",
+                                  reference=references.append)
+        command = Rosbag.instances[-1].command
+        self.assertEqual(command[:3], ["glim_rosbag", "/remap/input/bag_0", "--ros-args"])
+        self.assertIn("auto_quit:=true", command)
+        self.assertEqual((record["mode"], record["outcome"], record["map_saved"]), ("remap", "saved", True))
+        self.assertEqual(record["input_warnings"], {"lidar_gap": 1})
+        self.assertTrue(record["session"].endswith("-remap"))
+        self.assertEqual(references, [self.map_root / "maps/slam" / record["session"]])
+
     def test_shutdown_saves_and_reports_failures(self):
         controller = self.make()
         controller.transition("active")
@@ -455,6 +598,18 @@ class GlimProcessTests(unittest.TestCase):
         time.sleep(0.3)
         self.assertEqual(process.stop(5), ("not_started", -signal.SIGINT))
         self.assertTrue(ctl.stopped_cleanly("not_started", -signal.SIGINT))
+
+    def test_output_is_forwarded_and_observed(self):
+        seen = []
+        process = GlimProcess([sys.executable, "-c",
+                               "import sys; print('[glim] [warning] IMU timestamp rewind detected!!');"
+                               "sys.stdout.flush(); print('done', file=sys.stderr)"],
+                              on_line=seen.append)
+        process.start()
+        process.popen.wait()
+        process.reader.join(timeout=5)
+        self.assertEqual([line.strip() for line in seen],
+                         ["[glim] [warning] IMU timestamp rewind detected!!", "done"])
 
     def test_nonzero_exit_on_save_is_a_failure(self):
         process = GlimProcess(self.program(

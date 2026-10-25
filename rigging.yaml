@@ -56,6 +56,13 @@ replay:
 # Outputs are fixed — /<ns>/glim_ros/{odom,pose,points,aligned_points,map,...}, /tf, /diagnostics —
 # see README "ROS interface"; `rig graph --contract <instance>` prints the observed contract.
 
+# `rig run export`: this service slims its own map sessions (tools/export_maps.py via the
+# launcher's `export` verb). Profile options per instance: dump: full|trajectories|none (default
+# trajectories), logs: true|false. In place, anything but dump: full + logs is lossy (--lossy).
+export:
+  data: "maps/{name}"
+  modes: [whole-run, in-place]
+
 # Per-instance fallback map store, always mounted; map sessions land in it only when no data dir is
 # exported (standalone runs without GLIM_DATA_DIR, or a vehicle without data_dir — with one, maps go
 # to <data_dir>/current/maps/<name>/). rig removes it ONLY on final teardown (`rig down --purge`):
@@ -70,5 +77,9 @@ launch_surface:
   - glim-up
   - tools/render_config.py
   - tools/runtime_images.py
+  - tools/export_maps.py
+  - tools/eval_trajectory.py
+  - supervisor/glim_supervisor/__init__.py
+  - supervisor/glim_supervisor/trajectory.py
   - docker/compose/compose.deploy.yaml
   - docker/compose/compose.datadir.yaml

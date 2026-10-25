@@ -39,6 +39,11 @@ SECTIONS = {
     "config_odometry": "odometry_estimation", "config_sub_mapping": "sub_mapping",
     "config_global_mapping": "global_mapping",
 }
+# Keys this wrapper adds that upstream's defaults do not carry (its own patches/extensions); never
+# reported as unknown.
+WRAPPER_KEYS = {"glim_ros": {"publish_tf"}}
+MAP_EXPORT_MODULE = "libmap_export_monitor.so"   # ext/glim_map_export
+
 # Section -> the instance YAML's `glim:` module name, for operator-facing messages.
 MODULE_NAMES = {"glim_ros": "ros", "sensors": "sensors", "preprocess": "preprocess",
                 "odometry_estimation": "odometry", "sub_mapping": "sub_mapping",
@@ -109,13 +114,22 @@ def compose(defaults_dir, instance, session_dir):
                 raise ValueError(f"{defaults_dir / filename} has no `{section}` section")
             merged = dict(document[section])
             for name, value in (overrides.get(section) or {}).items():
-                if name not in merged:
+                if name not in merged and name not in WRAPPER_KEYS.get(section, ()):
                     warnings.append(f"glim.{MODULE_NAMES[section]}.{name} is not in upstream's "
                                     f"{filename} — applied, but GLIM may ignore it")
                 merged[name] = value
             if section == "glim_ros":
                 merged["enable_local_mapping"] = pipeline["local_mapping"]
                 merged["enable_global_mapping"] = pipeline["global_mapping"]
+                export = (instance.get("map") or {}).get("export_ply", False)
+                modules = list(merged.get("extension_modules") or [])
+                if export and pipeline["global_mapping"] and MAP_EXPORT_MODULE not in modules:
+                    modules.append(MAP_EXPORT_MODULE)
+                merged["extension_modules"] = modules
+                # the exporter's own section (ext/glim_map_export reads it from this file)
+                document["glim_service"] = {
+                    "export_ply": bool(export),
+                    "export_voxel_m": float((instance.get("map") or {}).get("export_voxel_m", 0.1))}
             elif section == "logging":
                 # GLIM's per-module log files travel with the session they describe.
                 merged.update(log_dir=str(session_dir / "logs"), save_logs=True)

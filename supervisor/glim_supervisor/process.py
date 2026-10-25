@@ -8,6 +8,8 @@ import logging
 import os
 import signal
 import subprocess
+import sys
+import threading
 import time
 
 LOG = logging.getLogger("glim-supervisor")
@@ -17,11 +19,17 @@ SIGKILL_GRACE_S = 5
 
 
 class GlimProcess:
-    def __init__(self, command, *, clock=time.monotonic):
+    """`on_line`, when set before start(), sees every line GLIM writes (stdout and stderr, merged).
+    The lines are forwarded to the supervisor's stderr unchanged, so the container log is the same
+    as if GLIM wrote it directly."""
+
+    def __init__(self, command, *, clock=time.monotonic, on_line=None):
         self.command = list(command)
         self.clock = clock
+        self.on_line = on_line
         self.popen = None
         self.started_at = None
+        self.reader = None
 
     @property
     def pid(self):
@@ -31,9 +39,30 @@ class GlimProcess:
         if self.popen is not None:
             raise RuntimeError("GLIM process already started")
         # Own session: container signals reach only the supervisor, which decides how GLIM stops.
-        self.popen = subprocess.Popen(self.command, start_new_session=True)
+        self.popen = subprocess.Popen(self.command, start_new_session=True,
+                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         self.started_at = self.clock()
+        self.reader = threading.Thread(target=self._pump, name="glim-log", daemon=True)
+        self.reader.start()
         LOG.info("started GLIM (pid %d): %s", self.popen.pid, " ".join(self.command))
+
+    def _pump(self):
+        # Never let a slow or failing consumer back-pressure GLIM: forward first, classify after,
+        # and swallow consumer errors. spdlog flushes per message, so lines arrive promptly.
+        sink = getattr(sys.stderr, "buffer", None)
+        for raw in iter(self.popen.stdout.readline, b""):
+            try:
+                if sink is not None:
+                    sink.write(raw)
+                    sink.flush()
+            except (OSError, ValueError):
+                pass
+            if self.on_line is not None:
+                try:
+                    self.on_line(raw.decode("utf-8", "replace"))
+                except Exception:
+                    pass
+        self.popen.stdout.close()
 
     def running(self):
         return self.popen is not None and self.popen.poll() is None
@@ -78,6 +107,8 @@ class GlimProcess:
         except subprocess.TimeoutExpired:  # unkillable (uninterruptible I/O): report, don't hang
             LOG.error("GLIM (pid %d) survived SIGKILL", self.popen.pid)
             return "save_timeout", None
+        if self.reader is not None:
+            self.reader.join(timeout=2)   # the last lines (the save) are in the log before we report
         if outcome == "saved" and code == -signal.SIGINT:
             # Killed by SIGINT's default action: rclcpp had not installed its handler yet, so GLIM
             # never finished initializing and no map can exist (seen within ~1 s of start under

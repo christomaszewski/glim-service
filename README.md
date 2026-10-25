@@ -22,7 +22,7 @@ depends on nothing from rig — rig depends on it through `rigging.yaml` and the
                                                │   └─ health monitor                           │
                                                └──────────────┬───────────────────────────────┘
                                                               ▼
-                                   <data_dir>/current/maps/slam/<session>/{session.json,config,logs,dump}
+                     <data_dir>/current/maps/slam/<session>/{session.json,config,logs,dump,map.ply,evaluation.json}
 ```
 
 - **`glim-up`** (the launcher) owns the per-instance mechanics: validate the config
@@ -45,7 +45,11 @@ autonomy/glim.example.yaml       annotated example config, wired to ouster `top`
 tools/render_config.py           config validation -> identity env + instance file (launch surface)
 tools/runtime_images.py          rig runtime-image planning / pinned up (shared helper, launch surface)
 tools/build_image.sh             `rig build` entrypoint; tools/rig-build.sh is rig's shared build helper
-tools/fetch_upstream.py          shallow-fetch the pinned SHAs (image build and local dev)
+tools/fetch_upstream.py          shallow-fetch the pinned SHAs and apply patches/ (image build and local dev)
+tools/export_maps.py             `rig run export` for map sessions (launch surface)
+tools/eval_trajectory.py         `glim-up <cfg> evaluate`: ATE of a session against a reference (launch surface)
+patches/glim_ros2/               the one upstream patch: a `publish_tf` switch for GLIM's TF broadcast
+ext/glim_map_export/             GLIM extension module: writes the optimized map as <session>/map.ply
 docker/Dockerfile.runtime        build GTSAM -> gtsam_points -> GLIM -> glim_ros2; slim runtime + gates
 docker/compose/compose.deploy.yaml   the per-instance compose; compose.datadir.yaml maps -> data dir
 docker/entrypoints/              ros-entrypoint.sh (ROS env, zenoh overrides), glim-statectl (state client)
@@ -109,7 +113,8 @@ Before the first real run, check the sensor configs too:
 ## Configuration
 
 `autonomy/glim.example.yaml` is the annotated reference; `tools/render_config.py` is the schema.
-Unknown keys anywhere in the wrapper blocks are errors — a typo must not pass as configured.
+Unknown keys anywhere in the wrapper blocks are errors, and so is a key given twice (YAML would
+keep the last one silently) — a typo must not pass as configured.
 
 | Block | Purpose |
 |---|---|
@@ -117,12 +122,14 @@ Unknown keys anywhere in the wrapper blocks are errors — a typo must not pass 
 | `initial_state` | `active` (default) or `standby`; `RIG_TARGET_STATE` (`rig up --standby`) wins |
 | `ros.use_sim_time` | omit to follow rig replay (`RIG_SIM_TIME`); explicit `true`/`false` wins both ways |
 | `inputs.points`, `inputs.imu` | the `PointCloud2` / `Imu` topics and optional QoS (profile name or mapping; omitted keys keep GLIM's defaults, e.g. the IMU's 1000-deep queue) |
-| `extrinsics.T_lidar_imu` | **required** — IMU pose in the lidar frame, `[x y z qx qy qz qw]`, unit quaternion enforced |
-| `frames` | `map`, `odom`, `base` (`""` = IMU frame), `imu`/`lidar` (`""` = from headers), `publish_imu_to_lidar` |
+| `extrinsics` | **required**, one of: `T_lidar_imu` — IMU pose in the lidar frame, `[x y z qx qy qz qw]`, unit quaternion enforced; or `from_tf: true` — looked up in the TF tree (`frames.lidar` ← `frames.imu`) at every session start |
+| `frames` | `map`, `odom`, `base` (`""` = IMU frame), `imu`/`lidar` (`""` = from headers), `publish_imu_to_lidar`, `publish_tf` (`false` = GLIM broadcasts no TF) |
 | `pipeline` | GLIM module preset: `lightweight` (default), `cpu`, `odometry` — see below |
 | `glim` | opaque per-module overrides (`ros`, `sensors`, `preprocess`, `odometry`, `sub_mapping`, `global_mapping`) |
-| `map.save_timeout_s` | budget for GLIM's final optimization + save on standby/stop; sizes the stop grace period |
-| `health` | `/diagnostics` interval, stall timeout, expected odometry rate, producer `limits` |
+| `map` | `save_timeout_s` (final optimization + save budget; sizes the stop grace), `min_free_gb` (disk guard), `keep_sessions` (fallback-volume retention), `export_ply` / `export_voxel_m` (the PLY map) |
+| `resources` | container `memory_limit_gb`, `cpus`, `cpuset`, and the `memory_guard_pct` that ends a session before an OOM kill |
+| `evaluation` | `reference_topic` (`nav_msgs/Odometry`, e.g. the INS's) and `max_dt_s`: score every session's trajectory against it |
+| `health` | `/diagnostics` interval, stall timeout, expected odometry rate, input-warning window, producer `limits` |
 | `zenoh` | rmw_zenoh session overrides — the fleet-uniform block the ouster wrapper and bag logger take |
 
 Pipelines (all CPU; the image is built without CUDA):
@@ -159,6 +166,14 @@ A frame can have only one parent, so decide ownership before enabling it on a ve
 - **With a URDF / static TF tree** — set `base: base_link`; GLIM looks up `<imu> → base_link`
   and publishes `odom → base_link`. Turn off the SBG's `tf.broadcast_odom_to_base`.
 - Leave `publish_imu_to_lidar: false` when the URDF or the Ouster's static TF connects the lidar frame.
+- **Another node owns `map`/`odom`** (a localization stack, or GLIM run beside another estimator
+  for comparison) — `publish_tf: false` silences GLIM's TF entirely; its odometry and pose topics
+  still publish. (A wrapper patch to glim_ros2, `patches/glim_ros2/`; upstream has no such switch.)
+
+With a URDF, `extrinsics.from_tf: true` takes `T_lidar_imu` from the same tree instead of a second
+hand-copied value: the supervisor looks up `frames.lidar ← frames.imu` before each session (both
+must be named), records the value in `session.json`, and fails the start if it is not published
+within 10 s.
 
 ## Operational states
 
@@ -216,14 +231,61 @@ rig standby slam / rig activate slam / rig up --standby   # the same, fleet-wide
   config/          the exact GLIM config the session ran with
   logs/            GLIM's per-module logs
   dump/            GLIM's map: factor graph, submaps, odom_*/traj_* trajectories (TUM format)
+  map.ply          the optimized global map as one point cloud (binary PLY, `map` frame, voxelized)
+  reference.tum    the evaluation reference recorded during the session (with `evaluation:`)
+  evaluation.json  trajectory accuracy against it (also summarized in session.json)
 ```
 
 Outcomes: `saved`; `not_started` (stopped before GLIM initialized — nothing to save); `exited`
 (GLIM ended on its own); `save_timeout` / `failed` (the dump may be incomplete); `interrupted` (the
 supervisor itself was killed mid-session; closed out at its next start); `failed_to_start`.
 `map_saved` is true only for a clean save of a non-empty dump. A session pins the run that was open
-when it **started** (rig's writer rule), and files are chowned to the data dir's owner. Open `dump/` with GLIM's `offline_viewer` on a desktop (it is not
-built into this headless image) to inspect, add manual loop closures, or export a PLY point cloud.
+when it **started** (rig's writer rule), and files are chowned to the data dir's owner. Open `dump/`
+with GLIM's `offline_viewer` on a desktop (it is not built into this headless image) to inspect or
+add manual loop closures; `map.ply` opens anywhere (CloudCompare, Open3D, PCL).
+
+Guards keep a long run from losing its map. With `resources.memory_limit_gb` set, a session that
+reaches `memory_guard_pct` of the limit is ended (map saved, `ended_by: memory guard` in
+`session.json`) and a fresh one starts at once — a long run becomes consecutive maps instead of an
+OOM kill. Below `map.min_free_gb` free, a running session is ended the same way and no new one
+starts until space returns. Both show on `/diagnostics` (`resources`, `service`).
+
+Retention: `map.keep_sessions: N` keeps the newest N sessions in the fallback volume. A data dir
+belongs to rig's run lifecycle and is never pruned here.
+
+### Exporting (`rig run export`)
+
+`rigging.yaml` declares `export: {data: maps/{name}}`, so `rig run export` hands each instance's
+sessions to `glim-up <cfg> export` (`tools/export_maps.py`). Per-instance profile options:
+
+| Option | Values | Effect |
+|---|---|---|
+| `dump` | `trajectories` (default), `full`, `none` | GLIM's dump: only the TUM trajectories and `graph.txt`; everything `offline_viewer` needs; or nothing |
+| `logs` | `true` (default), `false` | GLIM's per-module logs |
+
+`session.json`, `config/`, `map.ply`, `reference.tum` and `evaluation.json` always travel. Files are
+hardlinked where possible. In place, anything but `dump: full` + `logs: true` drops data and needs
+`--lossy`.
+
+## Offline remap and evaluation
+
+```bash
+./glim-up autonomy/slam.yaml remap /data/runs/r1/bags/main     # one or more rosbag2 dirs
+./glim-up autonomy/slam.yaml evaluate <session-dir> [reference.tum]
+```
+
+`remap` maps recorded bags with GLIM's own `glim_rosbag` at full speed, in a one-off container that
+is isolated from the vehicle's ROS graph (`ROS_AUTOMATIC_DISCOVERY_RANGE=OFF`) and can run while
+the live instance does. It uses this config's topics, extrinsics and `glim:` tuning, and writes an
+ordinary session (`<UTC start>-remap`) beside the live ones; with `evaluation:` the reference is
+read from the same bags. Use it to tune `glim:` against one recording without the real-time limit
+of `rig replay`. The summary (session, outcome, ATE) prints as JSON on stdout.
+
+`evaluate` (host-side, pure Python) scores a session's `dump/traj_imu.txt` against a TUM reference:
+nearest-time association within `max_dt_s`, rigid alignment (Horn), then ATE RMSE / mean / max and
+the final error as a share of path length. Sessions with `evaluation:` are scored automatically
+when they end. The reference body's lever arm to the IMU adds a constant, route-dependent error,
+so compare numbers across tunings of one recording, not across vehicles.
 
 ## ROS interface
 
@@ -254,6 +316,8 @@ The supervisor publishes `/diagnostics` every `health.interval_s`, following the
 | `<name>: odometry` | `fps.delivered`, `frame_age_s`, `fps.expected` | WARN when stalled, or GLIM is not running, while active |
 | `<name>: imu` | `fps.delivered`, `frame_age_s` | WARN when the IMU input stalls while active (measured with GLIM's own QoS, so it sees what GLIM can) |
 | `<name>: points` | `publishers` | WARN with no publisher (graph only: no second subscriber to the cloud) |
+| `<name>: input` | `glim.warnings.<category>`, `glim.warnings.last` | WARN for `health.warning_window_s` after GLIM itself reports bad input — clock mismatch, IMU gaps or wrong units, missing per-point time — with a hint naming the likely cause |
+| `<name>: resources` | `memory.used_gb`, `memory.limit_gb`, `memory.used_pct` | WARN within 10 points of the memory guard, and after a guard ended a session |
 | `<name>: storage` | `disk.free_gb`, `disk.free_pct` | producer `limits` only |
 
 Streams are demanded whenever the target is active — including while GLIM restarts — and reported
@@ -283,14 +347,15 @@ pipeline sustains in real time.
   an unresolvable library fails the build) plus the supervisor's `package.xml` (resolved by rosdep
   in the build stage, so the runtime stage is plain apt and touches nothing of the parent's); every
   ELF file must resolve and every library load fully bound in the runtime stage; and the ros-*
-  versions must match what GLIM compiled against. Only `glim_rosnode` ships (not `glim_rosbag`,
-  which would pull rosbag2 in for nothing); `created` is the wrapper commit's time.
+  versions must match what GLIM compiled against. `glim_rosnode`, `glim_rosbag` (for `remap`) and
+  the map-export extension ship and are checked; `created` is the wrapper commit's time.
 - CI (`.github/workflows/ci.yml`), on amd64 and arm64: the image build and its gates; the full
   test suite inside the image (including the supervisor process, its ROS lifecycle node and
   `/diagnostics` against a fake GLIM); a check that the image ships exactly the tested supervisor;
   and an end-to-end smoke test (`tests/e2e/smoke.sh`) — the real GLIM driven through `glim-up` on
-  synthetic lidar + IMU under both Fast DDS and Zenoh, asserting odometry, health, map saves and
-  session records. Plus `rig certify --require-build-check`, host regressions, build-contract
+  synthetic lidar + IMU + INS odometry under both Fast DDS and Zenoh, asserting odometry, TF,
+  health, map saves, the PLY export, evaluation, an offline remap of a recorded bag, a restart and
+  `publish_tf: false`. Plus `rig certify --require-build-check`, host regressions, build-contract
   tests and shellcheck.
 
 ```bash
@@ -309,12 +374,19 @@ GLIM_IMAGE=glim:dev tests/e2e/smoke.sh             # real GLIM end to end (RMW_I
    `gtsam::make_shared`, which GTSAM 4.3.0 removed — move to 4.3.0 only once GLIM has.
 3. Update the full SHAs (and the comments) in `glim.repos`, build the image, run the tests in it,
    and diff the upstream default configs for renamed keys (`git diff <old>..<new> -- config/`).
+4. `patches/glim_ros2/` must still apply (`fetch_upstream.py` checks before applying and fails the
+   build otherwise); refresh it against the new glim_ros2 if not. `ext/glim_map_export` uses GLIM's
+   `GlobalMappingCallbacks` and `ExtensionModule` API — rebuild catches a break there.
 
 ## Limitations
 
 - CPU-only. GLIM's GPU modules need a CUDA build variant per runtime (rig `build.platforms`, e.g.
   the fleet's `jp6`/`jp7`) and a CUDA userspace compatible with the Lyrical base; not built yet.
 - No camera or `glim_ext` extension modules (no OpenCV/cv_bridge in the image).
+- Mapping only: no localization against a prior map. GLIM's ROS node always starts a new map;
+  relocalizing in a saved one would need its own module.
+- The container runs as root (rmw_zenoh shared memory with the sensor containers); map files are
+  chowned to the data dir's owner.
 
 ## License
 

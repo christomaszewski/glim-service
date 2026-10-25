@@ -105,6 +105,19 @@ class ComposeTests(unittest.TestCase):
         self.assertEqual(len(warnings), 1)
         self.assertIn("glim.odometry.ivox_resolutoin", warnings[0])
 
+    def test_map_export_module_and_settings(self):
+        config_dir, warnings = glimconfig.compose(self.defaults, example_instance(), self.session)
+        document = self.load(config_dir, "config_ros.json")
+        self.assertEqual(document["glim_ros"]["extension_modules"],
+                         ["librviz_viewer.so", "libmap_export_monitor.so"])
+        self.assertEqual(document["glim_service"], {"export_ply": True, "export_voxel_m": 0.1})
+        self.assertTrue(document["glim_ros"]["publish_tf"])
+        self.assertEqual(warnings, [])   # wrapper-owned keys are not "unknown"
+        config_dir, _ = glimconfig.compose(self.defaults, example_instance(pipeline="odometry"),
+                                           self.session / "odo")
+        self.assertNotIn("libmap_export_monitor.so",   # no global map, nothing to export
+                         self.load(config_dir, "config_ros.json")["glim_ros"]["extension_modules"])
+
     def test_unknown_pipeline(self):
         instance = example_instance()
         instance["pipeline"] = "gpu"
